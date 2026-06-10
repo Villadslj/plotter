@@ -43,6 +43,14 @@ def test_cell_isolation_methods_exist(mock_main_window):
     assert "clearCellIsolation" in mock_main_window
 
 
+def test_navigate_to_cell_methods_exist(mock_main_window):
+    """Verify DAGMC-aware navigation methods are defined."""
+    assert "_navigateToCell" in mock_main_window
+    assert "_findCellInCurrentSlice" in mock_main_window
+    assert "_findCellBySliceScan" in mock_main_window
+    assert "_findCellBySampling" in mock_main_window
+
+
 def test_cell_isolation_actions_exist():
     """Verify the menu actions are created in createMenuBar."""
     import ast
