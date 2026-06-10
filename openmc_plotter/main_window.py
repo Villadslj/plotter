@@ -1092,8 +1092,6 @@ class MainWindow(QMainWindow):
         dict or None
             Dict with 'origin', 'width', 'height' if the cell was found.
         """
-        import copy as _copy
-
         av = self.model.activeView
         lower_left, upper_right = openmc.lib.global_bounding_box()
 
@@ -1108,16 +1106,17 @@ class MainWindow(QMainWindow):
         lo = lower_left[perp_idx]
         hi = upper_right[perp_idx]
         if np.isinf(lo) or np.isinf(hi):
-            # Fall back to a reasonable range around current origin
+            # Fall back to scanning a range proportional to the current view
             current_perp = av.origin[perp_idx]
-            lo = current_perp - 200.0
-            hi = current_perp + 200.0
+            fallback_half_range = max(av.width, av.height) * 5.0
+            lo = current_perp - fallback_half_range
+            hi = current_perp + fallback_half_range
 
-        # Use a low-resolution scan to keep this fast
-        scan_res = 50  # 50x50 pixels per probe slice
+        # Low-resolution probe to keep scanning fast
+        scan_res = 50
 
-        # Build a lightweight ViewParam for scanning
-        scan_view = _copy.deepcopy(av)
+        # Build a lightweight view copy for scanning
+        scan_view = copy.deepcopy(av)
         scan_view.h_res = scan_res
         scan_view.v_res = scan_res
 
