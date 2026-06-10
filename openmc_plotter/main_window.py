@@ -840,7 +840,7 @@ class MainWindow(QMainWindow):
         Returns the cell ID as an integer, or None if cancelled/invalid.
         """
         cell_id, ok = QInputDialog.getInt(
-            self, title, "Cell ID:", value=0, min=0)
+            self, title, "Cell ID:", value=1, min=1)
         if not ok:
             return None
 
