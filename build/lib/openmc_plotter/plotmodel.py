@@ -30,6 +30,23 @@ _OVERLAP = -3
 _MODEL_PROPERTIES = ('temperature', 'density')
 _PROPERTY_INDICES = {'temperature': 0, 'density': 1}
 
+CELL_SEARCH_DEFAULTS = {
+    'cellSearchNumSlices': 20,
+    'cellSearchSliceResolution': 50,
+    'cellSearchNumSamples': 3000,
+    'cellSearchCenterBias': 0.33,
+    'cellSearchCenterSpan': 0.30,
+    'cellSearchFallbackRange': 5.0,
+}
+
+
+def apply_cell_search_defaults(view):
+    for name, value in CELL_SEARCH_DEFAULTS.items():
+        if not hasattr(view, name):
+            setattr(view, name, value)
+
+    return view
+
 _REACTION_UNITS = 'reactions/source'
 _PRODUCTION_UNITS = 'particles/source'
 _ENERGY_UNITS = 'eV/source'
@@ -1227,6 +1244,7 @@ class PlotView:
 
         if restore_view is not None:
             self.view_ind = copy.copy(restore_view.view_ind)
+            apply_cell_search_defaults(self.view_ind)
             self.view_params = copy.copy(restore_view.view_params)
             if default_res is not None:
                 p = self.view_params
@@ -1234,6 +1252,7 @@ class PlotView:
                 p.v_res = int(default_res * p.height / p.width)
         else:
             self.view_ind = PlotViewIndependent()
+            apply_cell_search_defaults(self.view_ind)
             if default_res is not None:
                 self.view_params = ViewParam(origin, width, height, default_res)
             else:

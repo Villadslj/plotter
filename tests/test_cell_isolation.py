@@ -47,8 +47,14 @@ def test_navigate_to_cell_methods_exist(mock_main_window):
     """Verify DAGMC-aware navigation methods are defined."""
     assert "_navigateToCell" in mock_main_window
     assert "_findCellInCurrentSlice" in mock_main_window
+    assert "_findCellByBoundingBox" in mock_main_window
     assert "_findCellBySliceScan" in mock_main_window
     assert "_findCellBySampling" in mock_main_window
+    assert "_getRepresentativePixel" in mock_main_window
+    assert "_pixelToPlotPoint" in mock_main_window
+    assert "_getLocationFromMask" in mock_main_window
+    assert "_getCellSearchSettings" in mock_main_window
+    assert "_setCellSearchSettings" in mock_main_window
 
 
 def test_cell_isolation_actions_exist():
@@ -66,3 +72,33 @@ def test_cell_isolation_actions_exist():
     assert "Highlight Cell" in source
     assert "Isolate Cell" in source
     assert "lear Cell Isolation" in source
+
+
+def test_navigate_to_cell_search_settings_exist():
+    """Verify adjustable navigate-to-cell search settings are wired in."""
+    from pathlib import Path
+
+    main_window_path = Path(__file__).parent.parent / "openmc_plotter" / "main_window.py"
+    plotmodel_path = Path(__file__).parent.parent / "openmc_plotter" / "plotmodel.py"
+
+    main_source = main_window_path.read_text()
+    plotmodel_source = plotmodel_path.read_text()
+
+    settings = [
+        "cellSearchNumSlices",
+        "cellSearchSliceResolution",
+        "cellSearchNumSamples",
+        "cellSearchCenterBias",
+        "cellSearchCenterSpan",
+        "cellSearchFallbackRange",
+    ]
+
+    for setting in settings:
+        assert setting in main_source
+        assert setting in plotmodel_source
+
+    assert "Slice search count:" in main_source
+    assert "Slice search resolution:" in main_source
+    assert "Random samples:" in main_source
+    assert "Center-biased sample share:" in main_source
+    assert "Fallback range multiplier:" in main_source

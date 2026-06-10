@@ -11,9 +11,9 @@ from PySide6.QtGui import QKeyEvent, QAction
 from PySide6.QtWidgets import (QApplication, QLabel, QSizePolicy, QMainWindow,
                                QScrollArea, QMessageBox, QFileDialog,
                                QColorDialog, QInputDialog, QWidget, QDialog,
-                               QVBoxLayout, QHBoxLayout, QPlainTextEdit, 
+                               QVBoxLayout, QHBoxLayout, QPlainTextEdit,
                                QDialogButtonBox, QPushButton, QSpinBox,
-                               QGestureEvent)
+                               QDoubleSpinBox, QFormLayout, QGestureEvent)
 
 import openmc
 import openmc.lib
@@ -24,7 +24,8 @@ try:
 except ImportError:
     _HAVE_VTK = False
 
-from .plotmodel import PlotModel, DomainTableModel, hash_model
+from .plotmodel import (PlotModel, DomainTableModel, hash_model,
+                        CELL_SEARCH_DEFAULTS, apply_cell_search_defaults)
 from .plotgui import PlotImage, ColorDialog
 from .docks import TabbedDock
 from .overlays import ShortcutsOverlay
@@ -47,46 +48,119 @@ def _openmcReload(threads=None, model_path='.'):
 
 class CellInputDialog(QDialog):
     """Custom dialog for cell ID input with navigation option."""
-    
-    def __init__(self, parent, title, model_cells):
+
+    def __init__(self, parent, title, model_cells, search_settings=None):
         super().__init__(parent)
         self.setWindowTitle(title)
         self.model_cells = model_cells
         self.cell_id = None
         self.should_navigate = False
-        
+        self.search_settings = dict(CELL_SEARCH_DEFAULTS)
+        if search_settings is not None:
+            self.search_settings.update(search_settings)
+
         # Create layout
         layout = QVBoxLayout()
-        
-        # Add label and spin box for cell ID
-        self.label = QLabel("Enter Cell ID:")
-        layout.addWidget(self.label)
-        
+
+        form_layout = QFormLayout()
+
+        # Add spin box for cell ID
         self.spinBox = QSpinBox()
         self.spinBox.setMinimum(1)
         self.spinBox.setMaximum(2147483647)  # Max int
         self.spinBox.setValue(1)
-        layout.addWidget(self.spinBox)
-        
+        form_layout.addRow("Cell ID:", self.spinBox)
+
+        settings_label = QLabel("Navigate-to-cell search parameters:")
+        layout.addWidget(settings_label)
+
+        self.sliceCountBox = QSpinBox()
+        self.sliceCountBox.setRange(1, 500)
+        self.sliceCountBox.setValue(self.search_settings['cellSearchNumSlices'])
+        self.sliceCountBox.setToolTip(
+            'Number of slices to probe when the cell is outside the current '
+            'slice.')
+        form_layout.addRow("Slice search count:", self.sliceCountBox)
+
+        self.sliceResolutionBox = QSpinBox()
+        self.sliceResolutionBox.setRange(10, 1000)
+        self.sliceResolutionBox.setValue(
+            self.search_settings['cellSearchSliceResolution'])
+        self.sliceResolutionBox.setToolTip(
+            'Resolution of each slice probe. Increase for very small cells.')
+        form_layout.addRow("Slice search resolution:", self.sliceResolutionBox)
+
+        self.sampleCountBox = QSpinBox()
+        self.sampleCountBox.setRange(100, 1000000)
+        self.sampleCountBox.setSingleStep(100)
+        self.sampleCountBox.setValue(
+            self.search_settings['cellSearchNumSamples'])
+        self.sampleCountBox.setToolTip(
+            'Number of random samples used as the final fallback search.')
+        form_layout.addRow("Random samples:", self.sampleCountBox)
+
+        self.centerBiasBox = QDoubleSpinBox()
+        self.centerBiasBox.setRange(0.0, 1.0)
+        self.centerBiasBox.setDecimals(2)
+        self.centerBiasBox.setSingleStep(0.05)
+        self.centerBiasBox.setValue(
+            self.search_settings['cellSearchCenterBias'])
+        self.centerBiasBox.setToolTip(
+            'Fraction of random samples focused near the geometry center.')
+        form_layout.addRow("Center-biased sample share:", self.centerBiasBox)
+
+        self.centerSpanBox = QDoubleSpinBox()
+        self.centerSpanBox.setRange(0.01, 1.0)
+        self.centerSpanBox.setDecimals(2)
+        self.centerSpanBox.setSingleStep(0.05)
+        self.centerSpanBox.setValue(
+            self.search_settings['cellSearchCenterSpan'])
+        self.centerSpanBox.setToolTip(
+            'Relative width of the center-focused sampling region.')
+        form_layout.addRow("Center-biased search width:", self.centerSpanBox)
+
+        self.fallbackRangeBox = QDoubleSpinBox()
+        self.fallbackRangeBox.setRange(0.5, 1000.0)
+        self.fallbackRangeBox.setDecimals(1)
+        self.fallbackRangeBox.setSingleStep(0.5)
+        self.fallbackRangeBox.setValue(
+            self.search_settings['cellSearchFallbackRange'])
+        self.fallbackRangeBox.setToolTip(
+            'Multiplier for the fallback search range when the global '
+            'bounding box is infinite.')
+        form_layout.addRow("Fallback range multiplier:", self.fallbackRangeBox)
+
+        layout.addLayout(form_layout)
+
         # Add buttons
         button_layout = QHBoxLayout()
-        
+
         self.navigateBtn = QPushButton("Navigate to Cell")
         self.navigateBtn.clicked.connect(self.onNavigate)
         button_layout.addWidget(self.navigateBtn)
-        
+
         self.okBtn = QPushButton("OK")
         self.okBtn.setDefault(True)
         self.okBtn.clicked.connect(self.onOk)
         button_layout.addWidget(self.okBtn)
-        
+
         self.cancelBtn = QPushButton("Cancel")
         self.cancelBtn.clicked.connect(self.reject)
         button_layout.addWidget(self.cancelBtn)
-        
+
         layout.addLayout(button_layout)
         self.setLayout(layout)
-        
+
+    def _updateSearchSettings(self):
+        self.search_settings = {
+            'cellSearchNumSlices': self.sliceCountBox.value(),
+            'cellSearchSliceResolution': self.sliceResolutionBox.value(),
+            'cellSearchNumSamples': self.sampleCountBox.value(),
+            'cellSearchCenterBias': self.centerBiasBox.value(),
+            'cellSearchCenterSpan': self.centerSpanBox.value(),
+            'cellSearchFallbackRange': self.fallbackRangeBox.value(),
+        }
+
     def onNavigate(self):
         """Handle Navigate to Cell button click."""
         cell_id = self.spinBox.value()
@@ -95,10 +169,11 @@ class CellInputDialog(QDialog):
                 self, self.windowTitle(),
                 f"Cell ID {cell_id} was not found in the current model.")
             return
+        self._updateSearchSettings()
         self.cell_id = cell_id
         self.should_navigate = True
         self.accept()
-        
+
     def onOk(self):
         """Handle OK button click."""
         cell_id = self.spinBox.value()
@@ -107,6 +182,7 @@ class CellInputDialog(QDialog):
                 self, self.windowTitle(),
                 f"Cell ID {cell_id} was not found in the current model.")
             return
+        self._updateSearchSettings()
         self.cell_id = cell_id
         self.should_navigate = False
         self.accept()
@@ -664,6 +740,7 @@ class MainWindow(QMainWindow):
 
         if saved['version'] == self.model.version:
             self.model.activeView = saved['current']
+            apply_cell_search_defaults(self.model.activeView)
             # Handle backward compatibility for outline attributes
             if not hasattr(self.model.activeView, 'outlinesCell'):
                 self.model.activeView.outlinesCell = False
@@ -909,7 +986,15 @@ class MainWindow(QMainWindow):
 
     def _navigateToCell(self, cell_id):
         """Navigate to and zoom in on a specific cell.
-        
+
+        Uses a multi-strategy approach to locate cells reliably for both
+        native CSG models and DAGMC geometries:
+          1. Check if the cell is visible in the current rendered slice (fast).
+          2. For cells with a finite bounding box, use it directly (CSG path).
+          3. For DAGMC/infinite-bbox cells, scan slices along the perpendicular
+             axis to find a slice that intersects the cell.
+          4. Fall back to targeted random sampling within the global bbox.
+
         Parameters
         ----------
         cell_id : int
@@ -918,30 +1003,68 @@ class MainWindow(QMainWindow):
         cell = self.model.modelCells[cell_id]
         bbox = cell.bounding_box
         av = self.model.activeView
-        
-        # Check if bounding box is infinite (common for DAGMC cells)
-        has_inf = (np.any(np.isinf(bbox.lower_left)) or 
+        apply_cell_search_defaults(av)
+
+        # --- Strategy 1: Check the current rendered pixel map ---
+        # This is the fastest path and works identically for CSG and DAGMC.
+        location = self._findCellInCurrentSlice(cell_id)
+        if location is not None:
+            av.origin = list(location["center"])
+            av.width = location["width"]
+            av.height = location["height"]
+            self.applyChanges()
+            return
+
+        # Check if bounding box is finite (typical for native CSG cells)
+        has_inf = (np.any(np.isinf(bbox.lower_left)) or
                    np.any(np.isinf(bbox.upper_right)))
-        
-        if has_inf:
-            # For DAGMC or cells with infinite bounds, search for the cell
-            # by sampling points in the geometry
-            location = self._findCellLocation(cell_id)
-            if location is None:
-                QMessageBox.warning(
-                    self, "Navigate to Cell",
-                    f"Could not locate cell {cell_id}. It may not be present "
-                    "in the accessible geometry region.")
+
+        if not has_inf:
+            # --- Strategy 2: Finite bounding box (CSG cells) ---
+            location = self._findCellByBoundingBox(
+                cell_id, bbox, scan_res=av.cellSearchSliceResolution)
+            if location is not None:
+                av.origin = list(location["origin"])
+                av.width = location["width"]
+                av.height = location["height"]
+                self.applyChanges()
                 return
-            
-            # Use found location as center
-            av.origin = list(location)
-            
+
+        # --- Strategy 3: Slice scan for DAGMC cells ---
+        # DAGMC cells often have infinite bounding boxes reported by OpenMC,
+        # but they do exist at specific locations in the geometry. Scan slices
+        # along the perpendicular axis to find one that intersects the cell.
+        location = self._findCellBySliceScan(
+            cell_id,
+            num_slices=av.cellSearchNumSlices,
+            scan_res=av.cellSearchSliceResolution,
+            fallback_range_scale=av.cellSearchFallbackRange)
+        if location is not None:
+            av.origin = list(location["origin"])
+            av.width = location["width"]
+            av.height = location["height"]
+            self.applyChanges()
+            self.statusBar().showMessage(
+                f"Navigated to cell {cell_id} (found on a different slice).",
+                5000)
+            return
+
+        # --- Strategy 4: Targeted random sampling fallback ---
+        point = self._findCellBySampling(
+            cell_id,
+            num_samples=av.cellSearchNumSamples,
+            fallback_extent_scale=av.cellSearchFallbackRange,
+            center_bias=av.cellSearchCenterBias,
+            center_span=av.cellSearchCenterSpan)
+        if point is not None:
+            av.origin = list(point)
+
             # Use a reasonable default zoom (10% of global bbox)
             lower_left, upper_right = openmc.lib.global_bounding_box()
-            if not np.any(np.isinf(lower_left)) and not np.any(np.isinf(upper_right)):
+            if not np.any(np.isinf(lower_left)) and not np.any(
+                    np.isinf(upper_right)):
                 global_width = np.abs(upper_right - lower_left)
-                zoom_factor = 0.1  # 10% of global size
+                zoom_factor = 0.1
                 if av.basis == 'xy':
                     av.width = global_width[0] * zoom_factor
                     av.height = global_width[1] * zoom_factor
@@ -951,88 +1074,306 @@ class MainWindow(QMainWindow):
                 else:  # xz
                     av.width = global_width[0] * zoom_factor
                     av.height = global_width[2] * zoom_factor
-        else:
-            # Cell has finite bounding box - use it directly
-            center = bbox.center
-            av.origin = list(center)
-            
-            # Zoom in: set width/height based on bounding box dimensions
-            # Add 20% margin around the cell
-            margin = 1.2
-            bbox_width = bbox.width
-            
-            # Determine which dimensions correspond to the current view basis
-            if av.basis == 'xy':
-                av.width = bbox_width[0] * margin
-                av.height = bbox_width[1] * margin
-            elif av.basis == 'yz':
-                av.width = bbox_width[1] * margin
-                av.height = bbox_width[2] * margin
-            else:  # xz
-                av.width = bbox_width[0] * margin
-                av.height = bbox_width[2] * margin
-        
-        # Apply the changes to update the view
-        self.applyChanges()
 
-    def _findCellLocation(self, cell_id, num_samples=1000):
-        """Find a location where a cell exists by sampling points.
-        
-        For DAGMC cells or cells with infinite bounding boxes, this method
-        samples points in the global geometry to find where the cell exists.
-        
+            self.applyChanges()
+            return
+
+        # --- All strategies exhausted ---
+        QMessageBox.warning(
+            self, "Navigate to Cell",
+            f"Cell {cell_id} exists in the model but could not be located "
+            f"in the current view or nearby slices.\n\n"
+            f"Try increasing the navigate-to-cell search settings, changing "
+            f"the view basis, or adjusting the origin manually to a region "
+            f"where you expect this cell to appear.")
+
+    def _findCellInCurrentSlice(self, cell_id):
+        """Search the current rendered pixel map for a cell.
+
+        This is fast and reliable because id_map already contains the cell IDs
+        for every pixel in the current slice — works for both CSG and DAGMC.
+
+        Returns
+        -------
+        dict or None
+            Dict with 'center' (3D origin), 'width', 'height' if found.
+        """
+        if self.model.ids_map is None:
+            return None
+
+        cell_ids = self.model.cell_ids
+        mask = (cell_ids == cell_id)
+        if not np.any(mask):
+            return None
+
+        av = self.model.activeView
+        cv = self.model.currentView
+
+        location = self._getLocationFromMask(
+            cell_ids, cell_id, cv, margin=2.0, min_fraction=0.02)
+        if location is None:
+            return None
+
+        return {
+            "center": location["origin"],
+            "width": location["width"],
+            "height": location["height"],
+        }
+
+    def _findCellByBoundingBox(self, cell_id, bbox, scan_res=50):
+        """Probe a finite cell bounding box and return a slice with cell pixels."""
+        av = self.model.activeView
+        scan_view = copy.deepcopy(av)
+        scan_res = max(10, int(scan_res))
+        scan_view.h_res = scan_res
+        scan_view.v_res = scan_res
+        scan_view.origin = list(bbox.center)
+
+        bbox_width = bbox.width
+        margin = 1.2
+        min_width = av.width * 0.05
+        min_height = av.height * 0.05
+        if av.basis == 'xy':
+            scan_view.width = max(bbox_width[0] * margin, min_width)
+            scan_view.height = max(bbox_width[1] * margin, min_height)
+        elif av.basis == 'yz':
+            scan_view.width = max(bbox_width[1] * margin, min_width)
+            scan_view.height = max(bbox_width[2] * margin, min_height)
+        else:  # xz
+            scan_view.width = max(bbox_width[0] * margin, min_width)
+            scan_view.height = max(bbox_width[2] * margin, min_height)
+
+        try:
+            ids_map = openmc.lib.id_map(scan_view.view_params)
+        except Exception:
+            return None
+
+        return self._getLocationFromMask(
+            ids_map[:, :, 0], cell_id, scan_view, margin=1.2, min_fraction=0.05)
+
+    def _findCellBySliceScan(self, cell_id, num_slices=20, scan_res=50,
+                             fallback_range_scale=5.0):
+        """Scan slices along the perpendicular axis to find a DAGMC cell.
+
+        For DAGMC cells not visible in the current slice, this method generates
+        low-resolution id_maps at different positions along the axis
+        perpendicular to the current view basis.
+
+        Parameters
+        ----------
+        cell_id : int
+            The cell ID to search for
+        num_slices : int
+            Number of slices to test along the perpendicular axis
+        scan_res : int
+            Resolution of the temporary slice scan image
+        fallback_range_scale : float
+            Multiplier applied to the current view size when the global
+            bounding box is infinite
+
+        Returns
+        -------
+        dict or None
+            Dict with 'origin', 'width', 'height' if the cell was found.
+        """
+        av = self.model.activeView
+        lower_left, upper_right = openmc.lib.global_bounding_box()
+        num_slices = max(1, int(num_slices))
+        scan_res = max(10, int(scan_res))
+        fallback_range_scale = max(float(fallback_range_scale), 0.5)
+
+        # Determine the perpendicular axis index and its range
+        if av.basis == 'xy':
+            perp_idx = 2  # z-axis
+        elif av.basis == 'yz':
+            perp_idx = 0  # x-axis
+        else:  # xz
+            perp_idx = 1  # y-axis
+
+        lo = lower_left[perp_idx]
+        hi = upper_right[perp_idx]
+        if np.isinf(lo) or np.isinf(hi):
+            # Fall back to scanning a range proportional to the current view
+            current_perp = av.origin[perp_idx]
+            fallback_half_range = max(av.width, av.height) * fallback_range_scale
+            lo = current_perp - fallback_half_range
+            hi = current_perp + fallback_half_range
+
+        # Build a lightweight view copy for scanning
+        scan_view = copy.deepcopy(av)
+        scan_view.h_res = scan_res
+        scan_view.v_res = scan_res
+
+        slice_positions = np.linspace(lo, hi, num_slices)
+
+        for pos in slice_positions:
+            new_origin = list(av.origin)
+            new_origin[perp_idx] = pos
+            scan_view.origin = new_origin
+            try:
+                ids_map = openmc.lib.id_map(scan_view.view_params)
+            except Exception:
+                continue
+
+            scan_cell_ids = ids_map[:, :, 0]
+            mask = (scan_cell_ids == cell_id)
+            if not np.any(mask):
+                continue
+
+            location = self._getLocationFromMask(
+                scan_cell_ids, cell_id, scan_view, margin=2.5, min_fraction=0.05)
+            if location is not None:
+                return location
+
+        return None
+
+    def _findCellBySampling(self, cell_id, num_samples=3000,
+                            fallback_extent_scale=5.0, center_bias=0.33,
+                            center_span=0.30):
+        """Find a cell location by sampling random points in the geometry.
+
+        This is the last-resort fallback. It uses more samples than the
+        previous implementation and focuses sampling near the geometry center
+        (where DAGMC cells are more likely to exist) as well as uniformly.
+
         Parameters
         ----------
         cell_id : int
             The ID of the cell to find
         num_samples : int
-            Number of random points to sample
-            
+            Total number of random points to sample
+        fallback_extent_scale : float
+            Multiplier applied to the current view size when the global
+            bounding box is infinite
+        center_bias : float
+            Fraction of samples drawn from the center-biased region
+        center_span : float
+            Relative width of the center-biased region
+
         Returns
         -------
         numpy.ndarray or None
-            The [x, y, z] coordinates of a point in the cell, or None if not found
+            The [x, y, z] coordinates of a point in the cell, or None.
         """
-        # Get global bounding box
         lower_left, upper_right = openmc.lib.global_bounding_box()
-        
-        # If global bbox is infinite, use a reasonable default range
+        num_samples = max(1, int(num_samples))
+        fallback_extent_scale = max(float(fallback_extent_scale), 0.5)
+        center_bias = min(max(float(center_bias), 0.0), 1.0)
+        center_span = min(max(float(center_span), 0.01), 1.0)
+
         if np.any(np.isinf(lower_left)) or np.any(np.isinf(upper_right)):
-            lower_left = np.array([-100.0, -100.0, -100.0])
-            upper_right = np.array([100.0, 100.0, 100.0])
-        
-        # Sample random points in the global bounding box
-        found_points = []
+            # Use current view as reference for bounded sampling
+            av = self.model.activeView
+            center = np.array(av.origin, dtype=float)
+            half_extent = max(av.width, av.height) * fallback_extent_scale
+            lower_left = center - half_extent
+            upper_right = center + half_extent
+
+        center = (lower_left + upper_right) / 2.0
+        extent = upper_right - lower_left
+        av = self.model.activeView
+        scan_res = max(10, int(av.cellSearchSliceResolution))
+        sample_view = copy.deepcopy(av)
+        sample_view.h_res = scan_res
+        sample_view.v_res = scan_res
+
         for _ in range(num_samples):
-            point = np.random.uniform(lower_left, upper_right)
+            # Mix uniform and center-biased sampling for better coverage
+            # of typical DAGMC geometries (cells clustered near center)
+            if np.random.random() < center_bias:
+                sample_origin = (
+                    center
+                    + np.random.uniform(-center_span, center_span, 3) * extent
+                )
+            else:
+                # Uniform across full bbox
+                sample_origin = np.random.uniform(lower_left, upper_right)
+
+            sample_view.origin = list(sample_origin)
+
             try:
-                found_cell, _ = openmc.lib.find_cell(point)
-                if found_cell.id == cell_id:
-                    found_points.append(point)
-                    # Return early if we found it (no need to sample more)
-                    if len(found_points) >= 10:
-                        break
+                ids_map = openmc.lib.id_map(sample_view.view_params)
             except Exception:
-                # Point may be outside geometry or in void
                 continue
-        
-        if found_points:
-            # Return the average position of found points
-            return np.mean(found_points, axis=0)
-        
+
+            location = self._getLocationFromMask(
+                ids_map[:, :, 0], cell_id, sample_view, margin=2.5,
+                min_fraction=0.05)
+            if location is not None:
+                return np.array(location["origin"])
+
         return None
+
+    def _getRepresentativePixel(self, rows, cols):
+        row_center = rows.mean()
+        col_center = cols.mean()
+        offsets = (rows - row_center) ** 2 + (cols - col_center) ** 2
+        idx = np.argmin(offsets)
+        return rows[idx], cols[idx]
+
+    def _pixelToPlotPoint(self, view, row, col, h_res, v_res):
+        x_frac = ((col + 0.5) / h_res) - 0.5
+        y_frac = 0.5 - ((row + 0.5) / v_res)
+
+        origin = list(view.origin)
+        if view.basis == 'xy':
+            origin[0] += x_frac * view.width
+            origin[1] += y_frac * view.height
+        elif view.basis == 'yz':
+            origin[1] += x_frac * view.width
+            origin[2] += y_frac * view.height
+        else:  # xz
+            origin[0] += x_frac * view.width
+            origin[2] += y_frac * view.height
+
+        return origin
+
+    def _getLocationFromMask(self, cell_ids, cell_id, view, margin,
+                             min_fraction):
+        mask = (cell_ids == cell_id)
+        if not np.any(mask):
+            return None
+
+        rows, cols = np.where(mask)
+        row, col = self._getRepresentativePixel(rows, cols)
+        h_res = cell_ids.shape[1]
+        v_res = cell_ids.shape[0]
+        origin = self._pixelToPlotPoint(view, row, col, h_res, v_res)
+
+        col_span = cols.max() - cols.min() + 1
+        row_span = rows.max() - rows.min() + 1
+        width = (col_span / h_res) * view.width * margin
+        height = (row_span / v_res) * view.height * margin
+        width = max(width, view.width * min_fraction)
+        height = max(height, view.height * min_fraction)
+
+        return {"origin": origin, "width": width, "height": height}
 
     def _getValidCellId(self, title):
         """Prompt the user for a cell ID and validate it.
-        
+
         Shows a custom dialog with option to navigate to the cell.
 
         Returns tuple (cell_id, should_navigate) or (None, False) if cancelled.
         """
-        dialog = CellInputDialog(self, title, self.model.modelCells)
+        dialog = CellInputDialog(
+            self, title, self.model.modelCells, self._getCellSearchSettings())
         if dialog.exec() == QDialog.Accepted:
+            self._setCellSearchSettings(dialog.search_settings)
             return dialog.cell_id, dialog.should_navigate
         return None, False
+
+    def _getCellSearchSettings(self):
+        apply_cell_search_defaults(self.model.activeView)
+        return {
+            name: getattr(self.model.activeView, name)
+            for name in CELL_SEARCH_DEFAULTS
+        }
+
+    def _setCellSearchSettings(self, search_settings):
+        apply_cell_search_defaults(self.model.activeView)
+        for name in CELL_SEARCH_DEFAULTS:
+            setattr(self.model.activeView, name, search_settings[name])
 
     def highlightCellDialog(self):
         """Open dialog to highlight a specific cell."""
