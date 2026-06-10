@@ -388,6 +388,35 @@ class MainWindow(QMainWindow):
         self.outlineAct.toggled.connect(outline_connector)
         self.editMenu.addAction(self.outlineAct)
 
+        self.editMenu.addSeparator()
+
+        # Edit -> Cell Isolation
+        self.highlightCellAction = QAction('&Highlight Cell...', self)
+        self.highlightCellAction.setShortcut('Ctrl+H')
+        self.highlightCellAction.setToolTip('Highlight a specific cell ID')
+        self.highlightCellAction.setStatusTip('Enter a cell ID to highlight')
+        self.highlightCellAction.triggered.connect(self.highlightCellDialog)
+        self.editMenu.addAction(self.highlightCellAction)
+
+        self.isolateCellAction = QAction('&Isolate Cell...', self)
+        self.isolateCellAction.setShortcut('Ctrl+I')
+        self.isolateCellAction.setToolTip('Show only a specific cell ID')
+        self.isolateCellAction.setStatusTip(
+            'Enter a cell ID to isolate (mask all others)')
+        self.isolateCellAction.triggered.connect(self.isolateCellDialog)
+        self.editMenu.addAction(self.isolateCellAction)
+
+        self.clearCellIsolationAction = QAction(
+            'C&lear Cell Isolation', self)
+        self.clearCellIsolationAction.setShortcut('Ctrl+Shift+H')
+        self.clearCellIsolationAction.setToolTip(
+            'Clear cell highlighting/isolation')
+        self.clearCellIsolationAction.setStatusTip(
+            'Remove all cell highlighting and isolation')
+        self.clearCellIsolationAction.triggered.connect(
+            self.clearCellIsolation)
+        self.editMenu.addAction(self.clearCellIsolationAction)
+
         # View Menu
         self.dockAction = QAction('Hide &Dock', self)
         self.dockAction.setShortcut("Ctrl+D")
@@ -804,6 +833,105 @@ class MainWindow(QMainWindow):
         self.colorDialog.updateHighlighting()
         if apply:
             self.applyChanges()
+
+    def _getValidCellId(self, title):
+        """Prompt the user for a cell ID and validate it.
+
+        Returns the cell ID as an integer, or None if cancelled/invalid.
+        """
+        cell_id, ok = QInputDialog.getInt(
+            self, title, "Cell ID:", value=0, min=0)
+        if not ok:
+            return None
+
+        # Check if cell ID exists in the model
+        if cell_id not in self.model.modelCells:
+            QMessageBox.warning(
+                self, title,
+                f"Cell ID {cell_id} was not found in the current model.")
+            return None
+
+        return cell_id
+
+    def highlightCellDialog(self):
+        """Open dialog to highlight a specific cell."""
+        cell_id = self._getValidCellId("Highlight Cell")
+        if cell_id is None:
+            return
+        self._highlightCell(cell_id)
+
+    def isolateCellDialog(self):
+        """Open dialog to isolate (show only) a specific cell."""
+        cell_id = self._getValidCellId("Isolate Cell")
+        if cell_id is None:
+            return
+        self._isolateCell(cell_id)
+
+    def _highlightCell(self, cell_id):
+        """Highlight the given cell ID in the current view."""
+        av = self.model.activeView
+
+        # Switch to cell color mode if not already
+        if av.colorby != 'cell':
+            self.editColorBy('cell', apply=False)
+
+        # Clear existing highlights on cells
+        for cid in av.cells:
+            av.cells.set_highlight(cid, False)
+
+        # Set the target cell as highlighted
+        av.cells.set_highlight(cell_id, True)
+
+        # Ensure highlighting is enabled
+        av.highlighting = True
+        self.highlightingAct.blockSignals(True)
+        self.highlightingAct.setChecked(True)
+        self.highlightingAct.blockSignals(False)
+        self.colorDialog.updateHighlighting()
+
+        self.applyChanges()
+        self.statusBar().showMessage(
+            f'Cell {cell_id} highlighted.', 5000)
+
+    def _isolateCell(self, cell_id):
+        """Isolate (show only) the given cell ID by masking all others."""
+        av = self.model.activeView
+
+        # Switch to cell color mode if not already
+        if av.colorby != 'cell':
+            self.editColorBy('cell', apply=False)
+
+        # Mask all cells except the target; clear highlights
+        for cid in av.cells:
+            av.cells.set_masked(cid, cid != cell_id)
+            av.cells.set_highlight(cid, False)
+
+        # Ensure masking is enabled
+        av.masking = True
+        self.maskingAction.blockSignals(True)
+        self.maskingAction.setChecked(True)
+        self.maskingAction.blockSignals(False)
+        self.colorDialog.updateMasking()
+
+        self.applyChanges()
+        self.statusBar().showMessage(
+            f'Cell {cell_id} isolated (all others masked).', 5000)
+
+    def clearCellIsolation(self):
+        """Clear all cell masking and highlighting set by isolation."""
+        av = self.model.activeView
+
+        # Clear all cell masks and highlights
+        for cid in av.cells:
+            av.cells.set_masked(cid, False)
+            av.cells.set_highlight(cid, False)
+
+        self.colorDialog.updateMasking()
+        self.colorDialog.updateHighlighting()
+
+        self.applyChanges()
+        self.statusBar().showMessage(
+            'Cell isolation/highlighting cleared.', 5000)
 
     def toggleDockView(self):
         if self.dock.isVisible():
