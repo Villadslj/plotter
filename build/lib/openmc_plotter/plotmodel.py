@@ -1401,6 +1401,9 @@ class DomainViewDict(dict):
     def get_default_color(self, key: int):
         return self.get_defaults(key).color
 
+    def default_ids(self):
+        return self.defaults.keys()
+
     def set_name(self, key: int, name: Optional[str]):
         domain = self[key]
         self[key] = DomainView(domain.id, name, domain.color, domain.masked, domain.highlight)

@@ -25,7 +25,8 @@ except ImportError:
     _HAVE_VTK = False
 
 from .plotmodel import (PlotModel, DomainTableModel, hash_model,
-                        CELL_SEARCH_DEFAULTS, apply_cell_search_defaults)
+                        CELL_SEARCH_DEFAULTS, apply_cell_search_defaults,
+                        _OVERLAP)
 from .plotgui import PlotImage, ColorDialog
 from .docks import TabbedDock
 from .overlays import ShortcutsOverlay
@@ -207,6 +208,9 @@ class MainWindow(QMainWindow):
         self.plot_manager = None
         self.materialPropsDialog = None
         self.materialPropsText = None
+        self.overlap_cycle_locations = []
+        self.overlap_cycle_signature = None
+        self.overlap_cycle_index = -1
 
     def loadGui(self, use_settings_pkl=True):
 
@@ -553,6 +557,24 @@ class MainWindow(QMainWindow):
         self.isolateCellAction.triggered.connect(self.isolateCellDialog)
         self.addAction(self.isolateCellAction)
         self.editMenu.addAction(self.isolateCellAction)
+
+        self.navigateOverlapAction = QAction('Navigate to &Overlap', self)
+        self.navigateOverlapAction.setShortcut('Ctrl+Shift+I')
+        self.navigateOverlapAction.setToolTip('Find and zoom to an overlap region')
+        self.navigateOverlapAction.setStatusTip(
+            'Search nearby slices for an overlap region and zoom to it')
+        self.navigateOverlapAction.triggered.connect(self.navigateToOverlap)
+        self.addAction(self.navigateOverlapAction)
+        self.editMenu.addAction(self.navigateOverlapAction)
+
+        self.nextOverlapAction = QAction('Go to Ne&xt Overlap', self)
+        self.nextOverlapAction.setShortcut('Ctrl+Alt+I')
+        self.nextOverlapAction.setToolTip('Cycle to the next overlap region')
+        self.nextOverlapAction.setStatusTip(
+            'Move to the next detected overlap region')
+        self.nextOverlapAction.triggered.connect(self.nextOverlap)
+        self.addAction(self.nextOverlapAction)
+        self.editMenu.addAction(self.nextOverlapAction)
 
         self.clearCellIsolationAction = QAction(
             'C&lear Cell Isolation', self)
@@ -1012,6 +1034,7 @@ class MainWindow(QMainWindow):
             av.origin = list(location["center"])
             av.width = location["width"]
             av.height = location["height"]
+            self._updateGeometryPanelFromActiveView()
             self.applyChanges()
             return
 
@@ -1027,6 +1050,7 @@ class MainWindow(QMainWindow):
                 av.origin = list(location["origin"])
                 av.width = location["width"]
                 av.height = location["height"]
+                self._updateGeometryPanelFromActiveView()
                 self.applyChanges()
                 return
 
@@ -1043,6 +1067,7 @@ class MainWindow(QMainWindow):
             av.origin = list(location["origin"])
             av.width = location["width"]
             av.height = location["height"]
+            self._updateGeometryPanelFromActiveView()
             self.applyChanges()
             self.statusBar().showMessage(
                 f"Navigated to cell {cell_id} (found on a different slice).",
@@ -1075,6 +1100,7 @@ class MainWindow(QMainWindow):
                     av.width = global_width[0] * zoom_factor
                     av.height = global_width[2] * zoom_factor
 
+            self._updateGeometryPanelFromActiveView()
             self.applyChanges()
             return
 
@@ -1086,6 +1112,297 @@ class MainWindow(QMainWindow):
             f"Try increasing the navigate-to-cell search settings, changing "
             f"the view basis, or adjusting the origin manually to a region "
             f"where you expect this cell to appear.")
+
+    def navigateToOverlap(self):
+        """Navigate the current view to a nearby overlap region."""
+        locations = self._getOverlapCycleLocations(force_refresh=True)
+        if not locations:
+            self._showOverlapNotFoundMessage()
+            return
+
+        av = self.model.activeView
+        self.overlap_cycle_index = self._getNearestOverlapIndex(locations, av.origin)
+        self._applyOverlapLocation(locations[self.overlap_cycle_index],
+                                   'Navigated to overlap region.')
+
+    def nextOverlap(self):
+        """Cycle to the next detected overlap region."""
+        locations = self._getOverlapCycleLocations()
+        if not locations:
+            self._showOverlapNotFoundMessage()
+            return
+
+        if self.overlap_cycle_index < 0:
+            av = self.model.activeView
+            self.overlap_cycle_index = self._getNearestOverlapIndex(locations, av.origin)
+        else:
+            self.overlap_cycle_index = (self.overlap_cycle_index + 1) % len(locations)
+
+        current_num = self.overlap_cycle_index + 1
+        total = len(locations)
+        self._applyOverlapLocation(
+            locations[self.overlap_cycle_index],
+            f'Navigated to overlap region {current_num} of {total}.')
+
+    def _applyOverlapLocation(self, location, status_message):
+        av = self.model.activeView
+        av.origin = list(location["origin"])
+        av.width = location["width"]
+        av.height = location["height"]
+        self._updateGeometryPanelFromActiveView()
+        self.applyChanges()
+        self.statusBar().showMessage(status_message, 5000)
+
+    def _showOverlapNotFoundMessage(self):
+        QMessageBox.warning(
+            self, "Navigate to Overlap",
+            "No overlap region could be located in the current view or "
+            "nearby slices.\n\nTry enabling overlap coloring, changing "
+            "the view basis, or increasing the overlap search settings.")
+
+    def _getOverlapCycleLocations(self, force_refresh=False):
+        av = self.model.activeView
+        apply_cell_search_defaults(av)
+
+        signature = (
+            av.basis,
+            int(av.cellSearchNumSlices),
+            int(av.cellSearchSliceResolution),
+            int(av.cellSearchNumSamples),
+            round(float(av.cellSearchFallbackRange), 4),
+            round(float(av.cellSearchCenterBias), 4),
+            round(float(av.cellSearchCenterSpan), 4),
+        )
+
+        if force_refresh or self.overlap_cycle_signature != signature:
+            self.overlap_cycle_locations = self._collectOverlapLocations()
+            self.overlap_cycle_signature = signature
+            self.overlap_cycle_index = -1
+
+        return self.overlap_cycle_locations
+
+    def _collectOverlapLocations(self):
+        """Collect overlap regions across the current basis and nearby slices."""
+        av = self.model.activeView
+        av_origin = self._normalizeOrigin(av.origin)
+        scan_res = max(10, int(av.cellSearchSliceResolution))
+        locations = []
+
+        current_view = copy.deepcopy(av)
+        current_view.h_res = scan_res
+        current_view.v_res = scan_res
+        current_view.color_overlaps = True
+        locations.extend(
+            self._getOverlapLocationsForView(current_view, margin=2.0, min_fraction=0.02))
+
+        lower_left, upper_right = openmc.lib.global_bounding_box()
+        if av.basis == 'xy':
+            perp_idx = 2
+        elif av.basis == 'yz':
+            perp_idx = 0
+        else:
+            perp_idx = 1
+
+        lo = lower_left[perp_idx]
+        hi = upper_right[perp_idx]
+        fallback_range_scale = max(float(av.cellSearchFallbackRange), 0.5)
+        if np.isinf(lo) or np.isinf(hi):
+            current_perp = av_origin[perp_idx]
+            fallback_half_range = max(av.width, av.height) * fallback_range_scale
+            lo = current_perp - fallback_half_range
+            hi = current_perp + fallback_half_range
+
+        scan_view = copy.deepcopy(av)
+        scan_view.h_res = scan_res
+        scan_view.v_res = scan_res
+        scan_view.color_overlaps = True
+        num_slices = max(1, int(av.cellSearchNumSlices))
+
+        for pos in np.linspace(lo, hi, num_slices):
+            new_origin = list(av_origin)
+            new_origin[perp_idx] = pos
+            scan_view.origin = new_origin
+            locations.extend(
+                self._getOverlapLocationsForView(scan_view, margin=2.5, min_fraction=0.05))
+
+        deduped = self._dedupeOverlapLocations(locations, av.basis)
+        if deduped:
+            return self._sortOverlapLocations(deduped, av.basis)
+
+        sampled = self._findOverlapBySampling(
+            num_samples=av.cellSearchNumSamples,
+            fallback_extent_scale=av.cellSearchFallbackRange,
+            center_bias=av.cellSearchCenterBias,
+            center_span=av.cellSearchCenterSpan)
+        return [sampled] if sampled is not None else []
+
+    def _getOverlapLocationsForView(self, view, margin, min_fraction):
+        try:
+            ids_map = openmc.lib.id_map(view.view_params)
+        except Exception:
+            return []
+
+        return self._getLocationsFromMask(
+            ids_map[:, :, 0], _OVERLAP, view, margin=margin,
+            min_fraction=min_fraction)
+
+    def _getNearestOverlapIndex(self, locations, origin):
+        origin = self._normalizeOrigin(origin)
+        distances = [
+            np.linalg.norm(self._normalizeOrigin(location["origin"]) - origin)
+            for location in locations
+        ]
+        return int(np.argmin(distances))
+
+    def _sortOverlapLocations(self, locations, basis):
+        if basis == 'xy':
+            order = (2, 0, 1)
+        elif basis == 'yz':
+            order = (0, 1, 2)
+        else:
+            order = (1, 0, 2)
+
+        return sorted(locations,
+                      key=lambda loc: tuple(round(loc["origin"][idx], 6)
+                                            for idx in order))
+
+    def _dedupeOverlapLocations(self, locations, basis):
+        deduped = []
+        for location in self._sortOverlapLocations(locations, basis):
+            if not any(self._sameOverlapLocation(location, existing, basis)
+                       for existing in deduped):
+                deduped.append(location)
+        return deduped
+
+    def _sameOverlapLocation(self, first, second, basis):
+        if basis == 'xy':
+            plane_idx = (0, 1)
+            perp_idx = 2
+        elif basis == 'yz':
+            plane_idx = (1, 2)
+            perp_idx = 0
+        else:
+            plane_idx = (0, 2)
+            perp_idx = 1
+
+        first_origin = self._normalizeOrigin(first["origin"])
+        second_origin = self._normalizeOrigin(second["origin"])
+        plane_distance = np.linalg.norm(first_origin[list(plane_idx)] -
+                                        second_origin[list(plane_idx)])
+        perp_distance = abs(first_origin[perp_idx] - second_origin[perp_idx])
+        size_scale = max(first["width"], first["height"],
+                         second["width"], second["height"], 1e-9)
+
+        return (plane_distance <= 0.35 * size_scale and
+                perp_distance <= 0.60 * size_scale)
+
+    def _findOverlapInCurrentSlice(self):
+        """Search the current slice for overlap pixels."""
+        av = self.model.activeView
+        scan_res = max(10, int(av.cellSearchSliceResolution))
+        scan_view = copy.deepcopy(self.model.currentView)
+        scan_view.h_res = scan_res
+        scan_view.v_res = scan_res
+        scan_view.color_overlaps = True
+        locations = self._getOverlapLocationsForView(
+            scan_view, margin=2.0, min_fraction=0.02)
+        return locations[0] if locations else None
+
+    def _findOverlapBySliceScan(self, num_slices=20, scan_res=50,
+                                fallback_range_scale=5.0):
+        """Scan adjacent slices to find an overlap region."""
+        av = self.model.activeView
+        lower_left, upper_right = openmc.lib.global_bounding_box()
+        num_slices = max(1, int(num_slices))
+        scan_res = max(10, int(scan_res))
+        fallback_range_scale = max(float(fallback_range_scale), 0.5)
+
+        if av.basis == 'xy':
+            perp_idx = 2
+        elif av.basis == 'yz':
+            perp_idx = 0
+        else:
+            perp_idx = 1
+
+        lo = lower_left[perp_idx]
+        hi = upper_right[perp_idx]
+        if np.isinf(lo) or np.isinf(hi):
+            current_perp = av.origin[perp_idx]
+            fallback_half_range = max(av.width, av.height) * fallback_range_scale
+            lo = current_perp - fallback_half_range
+            hi = current_perp + fallback_half_range
+
+        scan_view = copy.deepcopy(av)
+        scan_view.h_res = scan_res
+        scan_view.v_res = scan_res
+        scan_view.color_overlaps = True
+
+        for pos in np.linspace(lo, hi, num_slices):
+            new_origin = list(av.origin)
+            new_origin[perp_idx] = pos
+            scan_view.origin = new_origin
+            try:
+                ids_map = openmc.lib.id_map(scan_view.view_params)
+            except Exception:
+                continue
+
+            locations = self._getLocationsFromMask(
+                ids_map[:, :, 0], _OVERLAP, scan_view, margin=2.5,
+                min_fraction=0.05)
+            if locations:
+                return locations[0]
+
+        return None
+
+    def _findOverlapBySampling(self, num_samples=3000,
+                               fallback_extent_scale=5.0, center_bias=0.33,
+                               center_span=0.30):
+        """Randomly sample the geometry to find an overlap region."""
+        lower_left, upper_right = openmc.lib.global_bounding_box()
+        num_samples = max(1, int(num_samples))
+        fallback_extent_scale = max(float(fallback_extent_scale), 0.5)
+        center_bias = min(max(float(center_bias), 0.0), 1.0)
+        center_span = min(max(float(center_span), 0.01), 1.0)
+
+        if np.any(np.isinf(lower_left)) or np.any(np.isinf(upper_right)):
+            av = self.model.activeView
+            center = self._normalizeOrigin(av.origin)
+            half_extent = max(av.width, av.height) * fallback_extent_scale
+            lower_left = center - half_extent
+            upper_right = center + half_extent
+
+        center = (lower_left + upper_right) / 2.0
+        extent = upper_right - lower_left
+        av = self.model.activeView
+        scan_res = max(10, int(av.cellSearchSliceResolution))
+        sample_view = copy.deepcopy(av)
+        sample_view.h_res = scan_res
+        sample_view.v_res = scan_res
+        sample_view.color_overlaps = True
+
+        for _ in range(num_samples):
+            if np.random.random() < center_bias:
+                sample_origin = (
+                    center
+                    + np.random.uniform(-center_span, center_span, 3) * extent
+                )
+            else:
+                sample_origin = np.random.uniform(lower_left, upper_right)
+
+            sample_view.origin = list(sample_origin)
+
+            try:
+                ids_map = openmc.lib.id_map(sample_view.view_params)
+            except Exception:
+                continue
+
+            locations = self._getLocationsFromMask(
+                ids_map[:, :, 0], _OVERLAP, sample_view, margin=2.5,
+                min_fraction=0.05)
+            if locations:
+                return locations[0]
+
+        return None
 
     def _findCellInCurrentSlice(self, cell_id):
         """Search the current rendered pixel map for a cell.
@@ -1311,6 +1628,79 @@ class MainWindow(QMainWindow):
         idx = np.argmin(offsets)
         return rows[idx], cols[idx]
 
+    def _updateGeometryPanelFromActiveView(self):
+        self.geometryPanel.updateOrigin()
+        self.geometryPanel.updateWidth()
+        self.geometryPanel.updateHeight()
+
+    def _normalizeOrigin(self, origin):
+        if hasattr(origin, 'dtype') and getattr(origin.dtype, 'names', None):
+            names = origin.dtype.names
+            if all(name in names for name in ('x', 'y', 'z')):
+                return np.array([origin['x'], origin['y'], origin['z']],
+                                dtype=float)
+            return np.array([origin[name] for name in names[:3]], dtype=float)
+
+        if all(hasattr(origin, axis) for axis in ('x', 'y', 'z')):
+            return np.array([origin.x, origin.y, origin.z], dtype=float)
+
+        return np.asarray(origin, dtype=float)
+
+    def _locationFromRowsCols(self, rows, cols, view, h_res, v_res, margin,
+                              min_fraction):
+        row, col = self._getRepresentativePixel(rows, cols)
+        origin = self._pixelToPlotPoint(view, row, col, h_res, v_res)
+
+        col_span = cols.max() - cols.min() + 1
+        row_span = rows.max() - rows.min() + 1
+        width = (col_span / h_res) * view.width * margin
+        height = (row_span / v_res) * view.height * margin
+        width = max(width, view.width * min_fraction)
+        height = max(height, view.height * min_fraction)
+
+        return {"origin": origin, "width": width, "height": height}
+
+    def _getLocationsFromMask(self, ids, domain_id, view, margin, min_fraction):
+        mask = (ids == domain_id)
+        if not np.any(mask):
+            return []
+
+        h_res = ids.shape[1]
+        v_res = ids.shape[0]
+        visited = np.zeros(mask.shape, dtype=bool)
+        locations = []
+        n_rows, n_cols = mask.shape
+
+        for start_row, start_col in np.argwhere(mask):
+            if visited[start_row, start_col]:
+                continue
+
+            stack = [(int(start_row), int(start_col))]
+            visited[start_row, start_col] = True
+            component_rows = []
+            component_cols = []
+
+            while stack:
+                row, col = stack.pop()
+                component_rows.append(row)
+                component_cols.append(col)
+
+                for next_row, next_col in ((row - 1, col), (row + 1, col),
+                                           (row, col - 1), (row, col + 1)):
+                    if (0 <= next_row < n_rows and 0 <= next_col < n_cols and
+                            mask[next_row, next_col] and
+                            not visited[next_row, next_col]):
+                        visited[next_row, next_col] = True
+                        stack.append((next_row, next_col))
+
+            rows = np.asarray(component_rows)
+            cols = np.asarray(component_cols)
+            locations.append(
+                self._locationFromRowsCols(rows, cols, view, h_res, v_res,
+                                           margin, min_fraction))
+
+        return locations
+
     def _pixelToPlotPoint(self, view, row, col, h_res, v_res):
         x_frac = ((col + 0.5) / h_res) - 0.5
         y_frac = 0.5 - ((row + 0.5) / v_res)
@@ -1335,19 +1725,10 @@ class MainWindow(QMainWindow):
             return None
 
         rows, cols = np.where(mask)
-        row, col = self._getRepresentativePixel(rows, cols)
         h_res = cell_ids.shape[1]
         v_res = cell_ids.shape[0]
-        origin = self._pixelToPlotPoint(view, row, col, h_res, v_res)
-
-        col_span = cols.max() - cols.min() + 1
-        row_span = rows.max() - rows.min() + 1
-        width = (col_span / h_res) * view.width * margin
-        height = (row_span / v_res) * view.height * margin
-        width = max(width, view.width * min_fraction)
-        height = max(height, view.height * min_fraction)
-
-        return {"origin": origin, "width": width, "height": height}
+        return self._locationFromRowsCols(rows, cols, view, h_res, v_res,
+                                          margin, min_fraction)
 
     def _getValidCellId(self, title):
         """Prompt the user for a cell ID and validate it.
@@ -1402,7 +1783,7 @@ class MainWindow(QMainWindow):
             self.editColorBy('cell', apply=False)
 
         # Clear existing highlights on cells
-        for cid in av.cells:
+        for cid in av.cells.default_ids():
             av.cells.set_highlight(cid, False)
 
         # Set the target cell as highlighted
@@ -1428,7 +1809,7 @@ class MainWindow(QMainWindow):
             self.editColorBy('cell', apply=False)
 
         # Mask all cells except the target; clear highlights
-        for cid in av.cells:
+        for cid in av.cells.default_ids():
             av.cells.set_masked(cid, cid != cell_id)
             av.cells.set_highlight(cid, False)
 
@@ -1448,7 +1829,7 @@ class MainWindow(QMainWindow):
         av = self.model.activeView
 
         # Clear all cell masks and highlights
-        for cid in av.cells:
+        for cid in av.cells.default_ids():
             av.cells.set_masked(cid, False)
             av.cells.set_highlight(cid, False)
 
