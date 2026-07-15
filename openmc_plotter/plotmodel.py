@@ -974,8 +974,8 @@ class PlotModel:
         return self.ids_map[:, :, 2]
 
 
-class ViewParam(openmc.lib.plot._PlotBase):
-    """Viewer settings that are needed for _PlotBase and are independent
+class ViewParam:
+    """Viewer settings needed for OpenMC slice plotting that are independent
     of all other plotter/model settings.
 
     Parameters
@@ -1013,7 +1013,6 @@ class ViewParam(openmc.lib.plot._PlotBase):
 
     def __init__(self, origin=(0, 0, 0), width=10, height=10, default_res=1000):
         """Initialize ViewParam attributes"""
-        super().__init__()
 
         # View Parameters
         self.level = -1
@@ -1223,7 +1222,7 @@ class PlotView:
     view_ind : PlotViewIndependent instance
         viewing parameters that are independent of the model
     view_params : ViewParam instance
-        view parameters necesary for _PlotBase
+        view parameters for OpenMC slice plotting
     cells : Dict of DomainView instances
         Dictionary of cell view settings by ID
     materials : Dict of DomainView instances
