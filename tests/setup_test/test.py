@@ -200,6 +200,25 @@ def assert_render_changes(viewport, change):
     assert not np.array_equal(after, before)
 
 
+def assert_rays_hit_model(result):
+    """Check that the camera of a rendered image casts the rays of OpenMC
+
+    The first visible surface of every pixel must lie on one of the cylinders
+    of the test model or on the plane y = 5.
+    """
+    depth = result.depth
+    rows, cols = np.nonzero(np.isfinite(depth))
+    assert rows.size > 0.1 * depth.size
+    for iy, ix in zip(rows[::7], cols[::7]):
+        origin, direction = result.camera.pixel_ray(
+            ix + 0.5, iy + 0.5, result.width, result.height)
+        x, y, _ = origin + float(depth[iy, ix]) * direction
+        radius = np.hypot(x, y)
+        distance = min(abs(radius - 2.0), abs(radius - 5.0),
+                       abs(radius - 10.0), abs(y - 5.0))
+        assert distance < 1e-3, (ix, iy, x, y)
+
+
 def test_particle_tracks_and_3d_view(tmpdir, qtbot, monkeypatch):
     h5py = pytest.importorskip('h5py')
     path = Path(tmpdir) / 'particle_1_5.h5'
@@ -262,6 +281,11 @@ def test_particle_tracks_and_3d_view(tmpdir, qtbot, monkeypatch):
         if viewport.renderer.extended:
             viewport.resetCamera()
             assert viewport.waitForRender(60000)
+            for projection in (render3d.ORTHOGRAPHIC, render3d.PERSPECTIVE):
+                viewport.setProjection(projection)
+                assert viewport.waitForRender(60000)
+                assert viewport.result.camera.projection == projection
+                assert_rays_hit_model(viewport.result)
             panel = mw.view3DPanel
             assert_render_changes(
                 viewport, lambda: panel.edgeGroupBox.setChecked(False))

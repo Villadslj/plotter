@@ -27,7 +27,7 @@ def oblique_camera(projection):
 def top_camera():
     """Orthographic camera looking down on a 40 x 40 image
 
-    The point (x, y, z) is at display position (2x + 20.5, 19.5 - 2y) and
+    The point (x, y, z) is at display position (2x + 20.5, 20.5 - 2y) and
     depth 21 - z.
     """
     return rd.Camera3D(forward=(0.0, 0.0, -1.0), up=(0.0, 1.0, 0.0),
@@ -337,7 +337,7 @@ def test_point_visibility_uses_depth_buffer():
               (5.0, 0.0, -5.0),   # nothing in front of it
               (-5.0, 0.0, 3.0)]   # above the surface
     xy, valid, visible = rd.point_visibility(cam, 40, 40, depth, points)
-    np.testing.assert_allclose(xy[0], (10.5, 19.5))
+    np.testing.assert_allclose(xy[0], (10.5, 20.5))
     assert valid.all()
     assert visible.tolist() == [True, False, True, True]
 
@@ -354,8 +354,8 @@ def test_track_overlay_splits_where_geometry_hides_track():
     runs = rd.track_overlay(cam, 40, 40, depth, below)
     assert [visible for _, visible in runs] == [False, True]
     (hidden, _), (shown, _) = runs
-    np.testing.assert_allclose(hidden[[0, -1]], [(4.5, 19.5), (20.5, 19.5)])
-    np.testing.assert_allclose(shown[[0, -1]], [(20.5, 19.5), (36.5, 19.5)])
+    np.testing.assert_allclose(hidden[[0, -1]], [(4.5, 20.5), (20.5, 20.5)])
+    np.testing.assert_allclose(shown[[0, -1]], [(20.5, 20.5), (36.5, 20.5)])
 
     def visibility(points, depth, see_through=None):
         return [v for _, v in rd.track_overlay(cam, 40, 40, depth, points,
@@ -386,7 +386,7 @@ def test_pick_finds_domain_and_position():
     result = rd.RenderResult(np.zeros((40, 40, 3), np.uint8), depth, ids,
                              top_camera(), 40, 40, 'cell',
                              rd.CAPABILITY_EXTENDED)
-    hit = result.pick(10.7, 9.2)
+    hit = result.pick(10.7, 10.2)
     assert (hit.domain_id, hit.depth) == (3, 21.0)
     np.testing.assert_allclose(hit.position, (-5.0, 5.0, 0.0))
     miss = result.pick(30.5, 9.5)

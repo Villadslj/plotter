@@ -495,27 +495,6 @@ class Camera3D:
 
     # Projection
 
-    def ortho_layout(self, width, height):
-        """Square render layout used for orthographic projections
-
-        OpenMC's orthographic projection spans the same distance vertically
-        and horizontally, so a square image is rendered and cropped.
-
-        Returns
-        -------
-        size : int
-            Width and height of the square image in pixels
-        x_offset, y_offset : int
-            Position of the cropped image within the square image
-        world_width : float
-            Width of the square image in [cm]
-        """
-        width = max(1, int(width))
-        height = max(1, int(height))
-        size = max(width, height)
-        return (size, (size - width) // 2, (size - height) // 2,
-                self.ortho_width * size / width)
-
     def project(self, points, width, height):
         """Project points onto an image rendered with this camera
 
@@ -539,17 +518,16 @@ class Camera3D:
         f, u, r = self.forward_vec, self.up_vec, self.right_vec
         rel = points - self.eye
         along = rel @ f
+        width = max(1, int(width))
+        height = max(1, int(height))
         if self.is_orthographic:
-            size, x_off, y_off, world_width = self.ortho_layout(width, height)
-            h = (rel @ r) / world_width * size + size / 2.0
-            v = (rel @ u) / world_width * size + size / 2.0
-            x = h + 0.5 - x_off
-            y = size - 0.5 - v - y_off
+            # Pixels are square and span ortho_width horizontally
+            scale = width / self.ortho_width
+            x = (rel @ r) * scale + width / 2.0 + 0.5
+            y = height / 2.0 - (rel @ u) * scale + 0.5
             depth = along
             valid = np.isfinite(along)
         else:
-            width = max(1, int(width))
-            height = max(1, int(height))
             tan2 = 2.0 * math.tan(math.radians(self.fov) / 2.0)
             valid = along > 1e-12
             safe = np.where(valid, along, 1.0)
@@ -568,15 +546,13 @@ class Camera3D:
         """
         f, u, r = self.forward_vec, self.up_vec, self.right_vec
         eye = self.eye
-        if self.is_orthographic:
-            size, x_off, y_off, world_width = self.ortho_layout(width, height)
-            h = x - 0.5 + x_off
-            v = size - 0.5 - y - y_off
-            origin = (eye + r * ((h - size / 2.0) / size) * world_width +
-                      u * ((v - size / 2.0) / size) * world_width)
-            return origin, f
         width = max(1, int(width))
         height = max(1, int(height))
+        if self.is_orthographic:
+            pixel = self.ortho_width / width
+            a = (x - 0.5 - width / 2.0) * pixel
+            b = (height / 2.0 - (y - 0.5)) * pixel
+            return eye + a * r + b * u, f
         tan2 = 2.0 * math.tan(math.radians(self.fov) / 2.0)
         a = (x - 0.5 - width / 2.0) * tan2 / width
         b = (height / 2.0 - (y - 0.5)) * tan2 / width
@@ -1014,11 +990,6 @@ class Renderer3D:
             camera.set_projection(PERSPECTIVE)
         width = max(1, int(request.width))
         height = max(1, int(request.height))
-        if camera.is_orthographic:
-            size, x_off, y_off, world_width = camera.ortho_layout(width, height)
-            render_width = render_height = size
-        else:
-            render_width, render_height = width, height
 
         depth = ids = normals = None
         with self.lock:
@@ -1026,7 +997,7 @@ class Renderer3D:
             start = time.perf_counter()
             plot = self._ensure_plot(request.color_by)
             self._apply_styles(plot, request.styles, request.styles_version)
-            plot.pixels = (render_width, render_height)
+            plot.pixels = (width, height)
             plot.camera_position = _tuple(camera.eye)
             plot.look_at = camera.target
             plot.up = camera.up
@@ -1035,8 +1006,8 @@ class Renderer3D:
             plot.diffuse_fraction = min(1.0, max(0.0,
                                                  request.diffuse_fraction))
             if self.extended:
-                plot.orthographic_width = (world_width if camera.is_orthographic
-                                           else None)
+                plot.orthographic_width = (camera.ortho_width
+                                           if camera.is_orthographic else None)
                 plot.clip_box = request.clip_box
                 plot.show_cut_faces = request.show_cut_faces
                 plot.background = to_rgb(request.background)
@@ -1046,17 +1017,6 @@ class Renderer3D:
             else:
                 plot.update_view()
                 image = plot.create_image()
-
-        if camera.is_orthographic:
-            # Row 0 of an orthographic image is at the bottom
-            def crop(buffer):
-                if buffer is None:
-                    return None
-                buffer = np.flipud(buffer)
-                return np.ascontiguousarray(
-                    buffer[y_off:y_off + height, x_off:x_off + width])
-            image, depth, ids, normals = (crop(image), crop(depth), crop(ids),
-                                          crop(normals))
 
         n_lost = int(np.count_nonzero(ids == LOST_RAY_ID)) if ids is not None \
             else 0
@@ -1077,7 +1037,7 @@ class Renderer3D:
                             capability=self.capability, final=request.final,
                             scale=request.scale, request_id=request.request_id,
                             epoch=request.epoch, seconds=seconds,
-                            rays=render_width * render_height,
+                            rays=width * height,
                             n_lost_rays=n_lost)
 
 
