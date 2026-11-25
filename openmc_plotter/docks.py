@@ -139,6 +139,29 @@ class TabbedDock(QDockWidget):
         self.containerWidget.setLayout(self.mainLayout)
         self.setWidget(self.containerWidget)
 
+    def addPanel(self, panel, title):
+        """Add a panel as a scrollable tab and return the index of the tab"""
+        scroll = QScrollArea()
+        scroll.setWidget(panel)
+        scroll.setWidgetResizable(True)
+        return self.tabWidget.addTab(scroll, title)
+
+    def showPanel(self, panel):
+        """Make the tab containing a panel the current tab"""
+        for i in range(self.tabWidget.count()):
+            scroll = self.tabWidget.widget(i)
+            if isinstance(scroll, QScrollArea) and scroll.widget() is panel:
+                self.tabWidget.setCurrentIndex(i)
+                return True
+        return False
+
+    def currentPanel(self):
+        """Panel of the current tab"""
+        scroll = self.tabWidget.currentWidget()
+        if isinstance(scroll, QScrollArea):
+            return scroll.widget()
+        return scroll
+
     def resizeEvent(self, event):
         self.main_window.resizeEvent(event)
 
@@ -152,6 +175,8 @@ class GeometryPanel(PlotterPanel):
 
     def __init__(self, model, font_metric, main_window, parent=None):
         super().__init__(model, font_metric, main_window, parent)
+
+        self._in3D = False
 
         # Create Controls
         self._createOriginBox()
@@ -365,10 +390,31 @@ class GeometryPanel(PlotterPanel):
 
     def updateColorBy(self):
         self.colorbyBox.setCurrentText(self.model.activeView.colorby)
-        if self.model.activeView.colorby != 'cell':
+        if self.model.activeView.colorby != 'cell' or self._in3D:
             self.universeLevelBox.setEnabled(False)
         else:
             self.universeLevelBox.setEnabled(True)
+
+    def set3DMode(self, enabled):
+        """Disable the controls that only apply to the 2D view
+
+        The 3D view uses the colors, masking and highlighting of the 2D view
+        but neither its slice, size and resolution nor its universe level.
+        """
+        self._in3D = bool(enabled)
+        tooltip = 'Only applies to the 2D view' if enabled else ''
+        for widget in (self.originGroupBox, self.widthBox, self.heightBox,
+                       self.basisBox, self.universeLevelBox,
+                       self.domainAlphaBox, self.visibilityBox,
+                       self.outlinesCellBox, self.outlinesMatBox,
+                       self.resGroupBox, self.zoomWidget):
+            widget.setEnabled(not enabled)
+            widget.setToolTip(tooltip)
+            label = self.opLayout.labelForField(widget)
+            if label is not None:
+                label.setEnabled(not enabled)
+                label.setToolTip(tooltip)
+        self.updateColorBy()
 
     def updateUniverseLevel(self):
         self.universeLevelBox.setCurrentIndex(self.model.activeView.level + 1)

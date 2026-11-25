@@ -59,6 +59,10 @@ can be used to generate images from the command line without opening the plotter
 ```console
 $ openmc-plotter -b view1.pltvw view1.pltvw view1.pltvw
 ```
+
+Batch mode generates images of the 2D view, even for view files saved while the
+3D view was shown.
+
 ## Troubleshooting
 
 Updates to the plotter can result in stale references to deprecated features. For example, it's possible that something like the following may appear after an update:
@@ -120,6 +124,114 @@ locations are projected onto the slice plane.
 
 ![Source plotting](./screenshots/source-sites.png)
 
+### 3D View
+
+The 3D view (View&rightarrow;3D View, <kbd>Ctrl</kbd>+<kbd>3</kbd>) renders the
+model with OpenMC's own ray tracer (`openmc.lib.SolidRayTracePlot`). Rays are
+tracked through the same geometry that is used for transport, so CSG and DAGMC
+models are shown exactly as OpenMC sees them, including lost rays at gaps and
+overlaps. The 3D view uses the colors of the 2D view: it is colored by cell or
+material, masked cells and materials are hidden and, while highlighting is
+active, cells and materials that are not highlighted are ghosted.
+
+The features available depend on the installed OpenMC:
+
+  - OpenMC 0.16.0 or newer: perspective views that can be rotated, panned and
+    zoomed.
+  - OpenMC with the extended ray tracer API: additionally orthographic views,
+    cut planes, partially transparent cells and materials, edge highlighting,
+    depth shading, lost ray highlighting and picking of cells and materials
+    with the mouse.
+
+The "3D View" tab of the dock shows which features are available and contains
+all settings of the 3D view:
+
+  - Camera : Projection, field of view and view presets (from &plusmn;X,
+    &plusmn;Y, &plusmn;Z or isometric).
+  - Shading : Light that follows the camera (headlight) or is fixed, ambient
+    light and background color.
+  - Visibility : Opacity of ghosted cells and materials, and lost ray
+    highlighting. The opacity of each cell and material is set in the "3D
+    Opacity" column of the Cells/Materials tabs of the color options dialog.
+    Right-click a cell or material in the 3D view to hide, ghost or isolate it
+    or to set its opacity. "Show All" undoes hiding, ghosting and isolation.
+  - Edges : Outlines of cells and materials, with adjustable sensitivity,
+    thickness and color.
+  - Depth Shading : Darkens surfaces with their distance from the camera.
+  - Cut Planes : Planes normal to the x-, y- and z-axes that cut away part of
+    the model. "Flip" selects which side is removed, and "Show cut faces" draws
+    the cut surfaces of cells as solid faces. Right-click the 3D view and
+    choose "Cut Plane Here" to place a plane at a point of the model.
+  - Performance : The resolution is adjusted dynamically. While the view is
+    rotated, panned or zoomed, previews are rendered at a resolution that
+    meets the "Preview time". Once the view stops changing, the image is
+    refined to the selected "Quality".
+  - Overlays : Particle tracks and the orientation of the axes.
+
+| Action                          | Control                                                 |
+|---------------------------------|---------------------------------------------------------|
+| Orbit                           | Left-drag, arrow keys                                   |
+| Pan                             | <kbd>Shift</kbd>+left-drag, middle-drag, <kbd>Shift</kbd>+arrow keys |
+| Zoom                            | Scroll, <kbd>Ctrl</kbd>+left-drag, <kbd>+</kbd>/<kbd>-</kbd> |
+| Set the center of rotation      | Double-click                                            |
+| Context menu                    | Right-click                                             |
+| Fit the view to the model       | <kbd>F</kbd>                                            |
+| Reset the camera                | <kbd>R</kbd>, <kbd>Home</kbd>                           |
+| View from +X, -X, +Y, -Y, +Z, -Z, isometric | <kbd>1</kbd>-<kbd>7</kbd>                   |
+| Toggle perspective/orthographic | <kbd>O</kbd>                                            |
+| Toggle edges                    | <kbd>E</kbd>                                            |
+| Toggle depth shading            | <kbd>D</kbd>                                            |
+| Toggle particle tracks          | <kbd>T</kbd>                                            |
+
+While the 3D view is shown, File&rightarrow;Save Image As... and
+File&rightarrow;Copy Image save and copy the 3D image. The settings of the 3D
+view are stored in view files (`.pltvw`). Batch mode always generates images of
+the 2D view.
+
+### Lost Particle Tracks
+
+When OpenMC loses a particle, e.g. because of a gap or an overlap in the
+geometry, it writes a particle restart file named `particle_<batch>_<id>.h5`
+(see `openmc.Settings.max_write_lost_particles`). The plotter shows these
+particles in the 2D and 3D views to locate the cause of the loss:
+
+  - Data&rightarrow;Open Particle Files... (<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>L</kbd>)
+    loads particle restart files. Track files written with `openmc -t`
+    (`tracks.h5`) can be loaded as well.
+  - Data&rightarrow;Open Lost Particle Folder... loads all `particle_*.h5`
+    files of a folder. When the model directory contains lost particle files,
+    the plotter points them out after the model is loaded.
+  - Data&rightarrow;Clear Particle Tracks removes all particles.
+
+With OpenMC builds that support `openmc.Settings.lost_particle_history`, the
+restart file also contains the state of the particle when it was lost (position,
+direction, energy, the cells it was in and the error message) and its most
+recent collisions and surface crossings:
+
+```python
+settings.lost_particle_history = 50
+```
+
+Older restart files only contain the source site of the particle. These
+particles can be replayed from the "Particles" tab of the dock, which runs
+`openmc -r <file> -t` in a temporary directory to record the complete track of
+the particle.
+
+Particle tracks are drawn in the color of the particle. The source site is
+marked with a green circle and the position where the particle was lost with a
+red cross and an arrow showing its direction. In the 2D view, the parts of
+tracks within the slice tolerance of the slice plane are drawn solid and the
+other parts dashed and faded. Hovering a marker or a recorded state shows its
+details, and right-clicking a track in the 2D view offers to show the particle
+in the 3D view.
+
+The "Particles" tab of the dock lists the loaded particles with their details.
+From there, particles can be shown in the 2D or 3D view (centered on where they
+were lost), the 3D view can be cut through where a particle was lost, and the
+display of the tracks (markers, recorded states, labels, slice tolerance, line
+width and dashed drawing of tracks hidden by the geometry in the 3D view) can
+be adjusted.
+
 # Options/Functionality
 
 ## Menu Bar:
@@ -145,6 +257,13 @@ locations are projected onto the slice plane.
 
   - View&rightarrow;Hide[Show] Dock : Hide/Show Dock.
   - View&rightarrow;Zoom... : Open dialog to input new zoom value.
+  - View&rightarrow;3D View : Switch between the 2D slice and the 3D view.
+  - View&rightarrow;Fit 3D View to Model : Show the whole model in the 3D view.
+  - View&rightarrow;Reset 3D Camera : Isometric 3D view of the whole model.
+
+  - Data&rightarrow;Open Particle Files... : Load lost particle restart files or track files.
+  - Data&rightarrow;Open Lost Particle Folder... : Load all lost particle restart files of a folder.
+  - Data&rightarrow;Clear Particle Tracks : Remove all particles.
 
   - Window&rightarrow;Main Window : Activate, bring main window to front.
   - Window&rightarrow;Color Options : [Open], activate, bring color options dialog to front.
@@ -253,6 +372,10 @@ locations are projected onto the slice plane.
   - openmc-plotter: primary executable. contains the major program logic used to interact with the application.
   - plotmodel.py: contains the underlying data structure of the plot model and application state.
   - plotgui.py: contains the bulk of the graphical elements of the application.
+  - render3d.py: camera, 3D view settings and the renderer built on OpenMC's ray tracer (`openmc.lib.SolidRayTracePlot`).
+  - view3d.py: the interactive 3D viewport, which renders in a background thread.
+  - particles.py: reading of particle restart and track files, and replay of lost particles.
+  - panels3d.py: the "3D View" and "Particles" tabs of the dock.
   - overlays.py: contains screen overlays seen in the GUI. Just keyboard shortcuts for now.
   - plot_colors.py: module with convenience functions for generating and modifying RGB/RGBA colors
   - assets: directory containing icons and images for the application

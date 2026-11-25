@@ -6,9 +6,10 @@ from PySide6.QtWidgets import (QWidget, QPushButton, QHBoxLayout, QVBoxLayout,
                                QFormLayout, QComboBox, QSpinBox, QLabel,
                                QDoubleSpinBox, QSizePolicy, QMessageBox,
                                QCheckBox, QRubberBand, QMenu, QDialog,
-                               QTabWidget, QTableView, QHeaderView)
+                               QTabWidget, QTableView, QHeaderView, QToolTip)
 from matplotlib.figure import Figure
 from matplotlib import lines as mlines
+from matplotlib.collections import LineCollection
 from matplotlib.colors import SymLogNorm
 from matplotlib.backends.backend_qt5agg import FigureCanvas
 import matplotlib.pyplot as plt
@@ -18,8 +19,13 @@ import numpy.ma as ma
 from .plot_colors import rgb_normalize, invert_rgb
 from .plotmodel import DomainDelegate, PlotModel
 from .plotmodel import _NOT_FOUND, _VOID_REGION, _OVERLAP, _MODEL_PROPERTIES
+from .particles import BIRTH_COLOR, LOSS_COLOR, slab_runs
 from .scientific_spin_box import ScientificDoubleSpinBox
 from .custom_widgets import HorizontalLine
+
+# Distance in logical pixels within which hovering a particle track shows
+# its details
+_TRACK_HOVER_RADIUS = 6.0
 
 
 class PlotUpdateOverlay(QWidget):
@@ -86,6 +92,12 @@ class PlotImage(FigureCanvas):
         self._last_tally_indicator_value = None
         self._last_data_indicator_value = None
 
+        # Hover targets of the particle tracks: (priority, points in data
+        # coordinates, particle, function returning the description of a
+        # point)
+        self._track_hover = []
+        self._track_tooltip_shown = False
+
         self.menu = QMenu(self)
         self.update_overlay = PlotUpdateOverlay(self)
 
@@ -96,6 +108,7 @@ class PlotImage(FigureCanvas):
     def leaveEvent(self, event):
         self.main_window.coord_label.hide()
         self.main_window.statusBar().showMessage("")
+        self._hideTrackToolTip()
 
     def mousePressEvent(self, event):
         self.main_window.coord_label.hide()
@@ -410,6 +423,11 @@ class PlotImage(FigureCanvas):
         else:
             self.main_window.statusBar().showMessage(" " + tallyInfo)
 
+        if event.buttons() == QtCore.Qt.NoButton:
+            self._updateTrackToolTip(event)
+        else:
+            self._hideTrackToolTip()
+
         # Update rubber band and values if mouse button held down
         if event.buttons() == QtCore.Qt.LeftButton:
             self.rubber_band.setGeometry(
@@ -560,6 +578,32 @@ class PlotImage(FigureCanvas):
                                         apply=True)
                     olapColorAction.triggered.connect(connector)
 
+        particles = getattr(self.model, 'particleTracks', None)
+        if particles:
+            self.menu.addSeparator()
+            hit = self._trackHit(event.pos())
+            if hit is not None:
+                particle = hit[0]
+                title = self.menu.addAction(particle.summary())
+                title.setEnabled(False)
+                detailsAction = self.menu.addAction('Show Particle Details')
+                detailsAction.triggered.connect(
+                    lambda checked=False, p=particle:
+                    self.main_window.showParticleDetails(p))
+                show3DAction = self.menu.addAction('Show Particle in 3D View')
+                viewport = getattr(self.main_window, 'viewport3d', None)
+                show3DAction.setEnabled(viewport is not None and
+                                        viewport.available)
+                show3DAction.triggered.connect(
+                    lambda checked=False, p=particle:
+                    self.main_window.showParticle(p, in3d=True))
+            tracksAction = self.menu.addAction('Show Particle Tracks')
+            tracksAction.setCheckable(True)
+            tracksAction.setChecked(
+                bool(self.model.particleOptions.get('show2d', True)))
+            tracksAction.toggled.connect(
+                self.main_window.toggleParticleTracks2D)
+
         self.menu.addSeparator()
         self.menu.addAction(self.main_window.copyImageAction)
         self.menu.addAction(self.main_window.saveImageAction)
@@ -574,6 +618,9 @@ class PlotImage(FigureCanvas):
             self.menu.addAction(self.main_window.highlightingAct)
             self.menu.addAction(self.main_window.overlapAct)
             self.menu.addSeparator()
+        toggle3DAction = getattr(self.main_window, 'toggle3DAction', None)
+        if toggle3DAction is not None:
+            self.menu.addAction(toggle3DAction)
         self.menu.addAction(self.main_window.dockAction)
 
         self.main_window.maskingAction.setChecked(cv.masking)
@@ -597,6 +644,8 @@ class PlotImage(FigureCanvas):
 
         # clear out figure
         self.figure.clear()
+        self._track_hover = []
+        self._hideTrackToolTip()
 
         cv = self.model.currentView
         # set figure bg color to match window
@@ -778,6 +827,7 @@ class PlotImage(FigureCanvas):
         # annotate outlines
         self.add_outlines()
         self.plotSourceSites()
+        self.plotParticleTracks()
 
         # annotate mesh boundaries
         for mesh_id in cv.mesh_annotations:
@@ -841,6 +891,209 @@ class PlotImage(FigureCanvas):
                         [s[v_idx] for s in sites_to_plot],
                         marker='o',
                         color=rgb_normalize(self.model.sourceSitesColor))
+
+    def plotParticleTracks(self):
+        """Draw the tracks of the loaded particles on the slice
+
+        Tracks are projected onto the slice. Parts of a track within the
+        slice tolerance of the slice plane are drawn solid and the other parts
+        dashed and faded, so tracks crossing the plane stand out from tracks
+        passing in front of or behind it.
+        """
+        self._track_hover = []
+        particles = getattr(self.model, 'particleTracks', None)
+        options = getattr(self.model, 'particleOptions', None) or {}
+        if not particles or not options.get('show2d', True) or self.ax is None:
+            return
+        particles = [p for p in particles if p.visible]
+        if not particles:
+            return
+
+        cv = self.model.currentView
+        basis = cv.view_params.basis
+        h = 'xyz'.index(basis[0])
+        v = 'xyz'.index(basis[1])
+        s = 3 - h - v
+        plane = float(cv.origin[s])
+        tolerance = float(options.get('sliceTolerance', 0.0) or 0.0)
+        if not (np.isfinite(tolerance) and tolerance > 0.0):
+            tolerance = 0.01 * float(cv.width)
+        lower, upper = plane - tolerance, plane + tolerance
+        line_width = max(0.5, float(options.get('lineWidth', 1.5)))
+        show_markers = options.get('showMarkers', True)
+        show_steps = options.get('showSteps', False)
+        show_labels = options.get('showLabels', True)
+        far_alpha = 0.4
+        ax = self.ax
+        white = (1.0, 1.0, 1.0)
+        birth_color = rgb_normalize(BIRTH_COLOR)
+        loss_color = rgb_normalize(LOSS_COLOR)
+
+        def position(point):
+            if point is None:
+                return None
+            point = np.asarray(point, dtype=float).reshape(-1)
+            if point.size < 3 or not np.all(np.isfinite(point[:3])):
+                return None
+            return point[:3]
+
+        def alpha(point):
+            return 1.0 if lower <= point[s] <= upper else far_alpha
+
+        def marker(point, symbol, size, layers, zorder):
+            for edge, face, edge_width in layers:
+                ax.plot([point[h]], [point[v]], linestyle='none',
+                        marker=symbol, markersize=size,
+                        markeredgecolor=edge, markerfacecolor=face,
+                        markeredgewidth=edge_width, zorder=zorder,
+                        scalex=False, scaley=False)
+
+        for p in particles:
+            color = tuple(float(c) / 255.0 for c in tuple(p.color)[:3])
+            solid = []
+            dashed = []
+            for ti, track in enumerate(p.tracks):
+                positions = np.asarray(track.positions, dtype=float)
+                if positions.ndim != 2 or len(positions) == 0:
+                    continue
+                for inside, vertices in slab_runs(positions, s, lower, upper):
+                    (solid if inside else dashed).append(vertices[:, (h, v)])
+
+                index = np.flatnonzero(np.all(np.isfinite(positions), axis=1))
+                if index.size == 0:
+                    continue
+                xy = positions[index][:, (h, v)]
+                if show_steps:
+                    near = (positions[index, s] >= lower) & \
+                        (positions[index, s] <= upper)
+                    for selection, a in ((near, 1.0), (~near, far_alpha)):
+                        if np.any(selection):
+                            ax.plot(xy[selection, 0], xy[selection, 1],
+                                    linestyle='none', marker='o',
+                                    markersize=3.5, markeredgewidth=0.0,
+                                    color=color, alpha=a, zorder=4.5,
+                                    scalex=False, scaley=False)
+                self._track_hover.append(
+                    (1, xy, p, lambda k, p=p, ti=ti, i=index:
+                     p.state_description(ti, int(i[k]))))
+
+            if dashed:
+                ax.add_collection(LineCollection(
+                    dashed, colors=[color + (far_alpha,)],
+                    linewidths=max(0.75, 0.8 * line_width),
+                    linestyles='--', zorder=3.5), autolim=False)
+            if solid:
+                ax.add_collection(LineCollection(
+                    solid, colors=[color], linewidths=line_width,
+                    capstyle='round', joinstyle='round', zorder=4),
+                    autolim=False)
+
+            if show_markers:
+                birth = position(p.birth)
+                if birth is not None:
+                    a = alpha(birth)
+                    marker(birth, 'o', 10, (
+                        (white + (a,), 'none', 3.5),
+                        (birth_color + (a,), birth_color + (a / 3,), 2.0)), 5)
+                    self._track_hover.append(
+                        (0, np.array([[birth[h], birth[v]]]), p,
+                         lambda k, p=p, b=birth:
+                         '{}\nSource position: ({:.6g}, {:.6g}, {:.6g})'
+                         .format(p.summary(), *b)))
+                loss = position(p.loss_position)
+                if loss is not None:
+                    a = alpha(loss)
+                    self._plotLossArrow(loss, p.loss_direction, (h, v),
+                                        loss_color + (a,), 0.06 * cv.width)
+                    marker(loss, 'x', 11, (
+                        (white + (a,), 'none', 4.5),
+                        (loss_color + (a,), 'none', 2.5)), 5.5)
+                    self._track_hover.append(
+                        (0, np.array([[loss[h], loss[v]]]), p,
+                         lambda k, p=p: p.describe()))
+
+            if show_labels:
+                anchor = position(p.key_position())
+                if anchor is not None:
+                    a = alpha(anchor)
+                    text = ('#{}'.format(p.particle_id)
+                            if p.particle_id is not None else p.label)
+                    ax.annotate(text, xy=(anchor[h], anchor[v]),
+                                xytext=(9, 9), textcoords='offset points',
+                                fontsize=8, color=color, alpha=a, zorder=6,
+                                bbox=dict(boxstyle='round,pad=0.2',
+                                          facecolor=white + (0.75 * a,),
+                                          edgecolor=color + (a,),
+                                          linewidth=0.8))
+
+    def _plotLossArrow(self, loss, direction, axes, color, length):
+        """Draw an arrow in the direction a particle was lost in"""
+        if direction is None:
+            return
+        u = np.asarray(direction, dtype=float).reshape(-1)[:3]
+        norm = float(np.linalg.norm(u)) if u.size == 3 else 0.0
+        if not np.isfinite(norm) or norm <= 0.0:
+            return
+        # The arrow shows the component of the direction in the slice, so it
+        # vanishes for particles moving normal to the slice
+        u = u[list(axes)] / norm
+        if float(np.linalg.norm(u)) < 0.05:
+            return
+        start = loss[list(axes)]
+        self.ax.annotate('', xy=tuple(start + length * u), xytext=tuple(start),
+                         arrowprops=dict(arrowstyle='-|>', color=color,
+                                         linewidth=1.8, shrinkA=0, shrinkB=0,
+                                         mutation_scale=12),
+                         zorder=5)
+
+    def _trackHit(self, pos):
+        """Particle track feature at a position of the canvas
+
+        Parameters
+        ----------
+        pos : QtCore.QPoint
+            Position in widget coordinates
+
+        Returns
+        -------
+        tuple or None
+            The particle and a description of the feature at the position
+        """
+        if not self._track_hover or self.ax is None:
+            return None
+        x, y = self.mouseEventCoords(pos)
+        if not self.ax.bbox.contains(x, y):
+            return None
+        ratio = float(getattr(self, 'device_pixel_ratio', None) or
+                      self.devicePixelRatioF())
+        radius2 = (_TRACK_HOVER_RADIUS * ratio) ** 2
+        transform = self.ax.transData
+        best = None
+        for priority, xy, particle, text_fn in self._track_hover:
+            display = transform.transform(xy)
+            d2 = (display[:, 0] - x) ** 2 + (display[:, 1] - y) ** 2
+            k = int(np.argmin(d2))
+            if d2[k] > radius2:
+                continue
+            key = (priority, float(d2[k]))
+            if best is None or key < best[0]:
+                best = (key, particle, text_fn, k)
+        if best is None:
+            return None
+        return best[1], best[2](best[3])
+
+    def _updateTrackToolTip(self, event):
+        hit = self._trackHit(event.pos())
+        if hit is None:
+            self._hideTrackToolTip()
+            return
+        QToolTip.showText(self.mapToGlobal(event.pos()), hit[1], self)
+        self._track_tooltip_shown = True
+
+    def _hideTrackToolTip(self):
+        if self._track_tooltip_shown:
+            QToolTip.hideText()
+            self._track_tooltip_shown = False
 
     def add_outlines(self):
         cv = self.model.currentView
