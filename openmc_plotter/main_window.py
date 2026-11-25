@@ -1,5 +1,6 @@
 import copy
 from functools import partial
+import math
 from pathlib import Path
 import pickle
 from threading import Thread
@@ -13,7 +14,8 @@ from PySide6.QtWidgets import (QApplication, QLabel, QSizePolicy, QMainWindow,
                                QColorDialog, QInputDialog, QWidget, QDialog,
                                QVBoxLayout, QHBoxLayout, QPlainTextEdit,
                                QDialogButtonBox, QPushButton, QSpinBox,
-                               QDoubleSpinBox, QFormLayout, QGestureEvent)
+                               QDoubleSpinBox, QFormLayout, QGestureEvent,
+                               QStackedWidget)
 
 import openmc
 import openmc.lib
@@ -26,25 +28,35 @@ except ImportError:
 
 from .plotmodel import (PlotModel, DomainTableModel, hash_model,
                         CELL_SEARCH_DEFAULTS, apply_cell_search_defaults,
-                        _OVERLAP)
+                        _OVERLAP, OPENMC_LIB_LOCK, bump_lib_generation)
 from .plotgui import PlotImage, ColorDialog
 from .docks import TabbedDock
 from .overlays import ShortcutsOverlay
 from .tools import ExportDataDialog, SourceSitesDialog
+from .panels3d import View3DPanel, ParticlePanel
+from .particles import (assign_colors, focus_width, load_particle_file,
+                        scan_directory)
+from .render3d import View3DState
+from .view3d import Viewport3D, capability_message
 
 
 def _openmcReload(threads=None, model_path='.'):
-    # reset OpenMC memory, instances
-    openmc.lib.reset()
-    openmc.lib.finalize()
-    # initialize geometry (for volume calculation)
-    openmc.lib.settings.output_summary = False
-    args = ["-c"]
-    if threads is not None:
-        args += ["-s", str(threads)]
-    args.append(str(model_path))
-    openmc.lib.init(args)
-    openmc.lib.settings.verbosity = 1
+    # The lock keeps the 2D plot and 3D render threads out of openmc.lib
+    # while it is re-initialized
+    with OPENMC_LIB_LOCK:
+        # reset OpenMC memory, instances
+        openmc.lib.reset()
+        openmc.lib.finalize()
+        # Ray-traced plots refer to the finalized geometry
+        bump_lib_generation()
+        # initialize geometry (for volume calculation)
+        openmc.lib.settings.output_summary = False
+        args = ["-c"]
+        if threads is not None:
+            args += ["-s", str(threads)]
+        args.append(str(model_path))
+        openmc.lib.init(args)
+        openmc.lib.settings.verbosity = 1
 
 
 class CellInputDialog(QDialog):
@@ -216,6 +228,9 @@ class MainWindow(QMainWindow):
 
         self.pixmap = None
         self.zoom = 100
+        self.in3D = False
+        # The 2D plot needs a redraw that was deferred while in the 3D view
+        self._pixmapDirty = False
 
         self.loadModel(use_settings_pkl=use_settings_pkl)
 
@@ -225,7 +240,14 @@ class MainWindow(QMainWindow):
         self.frame.setCornerWidget(cw)
         self.frame.setAlignment(QtCore.Qt.AlignCenter)
         self.frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.setCentralWidget(self.frame)
+
+        # The 2D plot and the ray-traced 3D view share the central area
+        self.viewport3d = Viewport3D(self.model, self)
+        self.viewStack = QStackedWidget(self)
+        self.viewStack.addWidget(self.frame)
+        self.viewStack.addWidget(self.viewport3d)
+        self.viewStack.setCurrentWidget(self.frame)
+        self.setCentralWidget(self.viewStack)
 
         # connect pinch gesture (OSX)
         self.grabGesture(QtCore.Qt.PinchGesture)
@@ -245,6 +267,15 @@ class MainWindow(QMainWindow):
         self.tallyPanel = self.dock.tallyPanel
         self.meshAnnotationPanel = self.dock.meshAnnotationPanel
 
+        # 3D view settings and particle tracks
+        self.view3DPanel = View3DPanel(self.model, self.font_metric, self,
+                                       self.viewport3d, self.dock)
+        self.particlePanel = ParticlePanel(self.model, self.font_metric, self,
+                                           self.dock)
+        self.dock.addPanel(self.view3DPanel, "3D View")
+        self.dock.addPanel(self.particlePanel, "Particles")
+        self.viewport3d.stateChanged.connect(self.particlePanel.updateOptions)
+
         # Color Dialog
         self.colorDialog = ColorDialog(self.model, self.font_metric, self)
         self.colorDialog.hide()
@@ -263,6 +294,7 @@ class MainWindow(QMainWindow):
         # Create menubar
         self.createMenuBar()
         self.updateEditMenu()
+        self._sync3DControls()
 
         # Status Bar
         self.coord_label = QLabel()
@@ -281,9 +313,15 @@ class MainWindow(QMainWindow):
         self.tallyPanel.update()
         self.colorDialog.updateDialogValues()
 
+        # Bounds of the 3D scene and ranges of the cut planes
+        if self.viewport3d.available:
+            self.viewport3d.modelReloaded()
+
         QtCore.QTimer.singleShot(0, self.requestPlotUpdate)
 
         self.plotIm.frozen = False
+
+        self._announceLostParticles()
 
     def event(self, event):
         # use pinch event to update zoom
@@ -381,10 +419,38 @@ class MainWindow(QMainWindow):
         self.importPropertiesAction.setToolTip("Import properties")
         self.importPropertiesAction.triggered.connect(self.importProperties)
 
+        self.openParticlesAction = QAction("Open &Particle Files...", self)
+        self.openParticlesAction.setShortcut("Ctrl+Shift+L")
+        self.openParticlesAction.setToolTip(
+            "Load lost particle restart files or track files")
+        self.openParticlesAction.setStatusTip(
+            "Show the tracks of lost particles (particle_*.h5) or of track "
+            "files in the 2D and 3D views")
+        self.openParticlesAction.triggered.connect(self.openParticleFiles)
+
+        self.openParticleFolderAction = QAction(
+            "Open Lost Particle &Folder...", self)
+        self.openParticleFolderAction.setToolTip(
+            "Load all particle_*.h5 files of a folder")
+        self.openParticleFolderAction.setStatusTip(
+            "Load all lost particle restart files (particle_*.h5) of a folder")
+        self.openParticleFolderAction.triggered.connect(
+            self.openParticleFolder)
+
+        self.clearParticlesAction = QAction("Clear Particle &Tracks", self)
+        self.clearParticlesAction.setToolTip("Remove all particle tracks")
+        self.clearParticlesAction.setStatusTip("Remove all particle tracks")
+        self.clearParticlesAction.triggered.connect(self.clearParticleTracks)
+        self.clearParticlesAction.setEnabled(bool(self.model.particleTracks))
+
         self.dataMenu = self.mainMenu.addMenu('D&ata')
         self.dataMenu.addAction(self.openStatePointAction)
         self.dataMenu.addAction(self.sourceSitesAction)
         self.dataMenu.addAction(self.importPropertiesAction)
+        self.particleMenuSeparator = self.dataMenu.addSeparator()
+        self.dataMenu.addAction(self.openParticlesAction)
+        self.dataMenu.addAction(self.openParticleFolderAction)
+        self.dataMenu.addAction(self.clearParticlesAction)
         self.updateDataMenu()
 
         # Edit Menu
@@ -601,10 +667,36 @@ class MainWindow(QMainWindow):
         self.zoomAction.setStatusTip('Edit zoom factor')
         self.zoomAction.triggered.connect(self.editZoomAct)
 
+        self.toggle3DAction = QAction('&3D View', self)
+        self.toggle3DAction.setShortcut('Ctrl+3')
+        self.toggle3DAction.setCheckable(True)
+        self.toggle3DAction.setToolTip('Switch between the 2D and 3D views')
+        self.toggle3DAction.setStatusTip(
+            'Switch between the 2D slice plot and the ray-traced 3D view')
+        self.toggle3DAction.triggered.connect(self.toggle3DView)
+
+        self.fit3DAction = QAction('&Fit 3D View to Model', self)
+        self.fit3DAction.setToolTip('Show the whole model in the 3D view')
+        self.fit3DAction.setStatusTip('Show the whole model in the 3D view')
+        self.fit3DAction.triggered.connect(
+            lambda checked=False: self._run3D(self.viewport3d.fit))
+
+        self.reset3DCameraAction = QAction('Reset 3D &Camera', self)
+        self.reset3DCameraAction.setToolTip(
+            'Isometric view of the whole model')
+        self.reset3DCameraAction.setStatusTip(
+            'Reset the 3D camera to an isometric view of the whole model')
+        self.reset3DCameraAction.triggered.connect(
+            lambda checked=False: self._run3D(self.viewport3d.resetCamera))
+
         self.viewMenu = self.mainMenu.addMenu('&View')
         self.viewMenu.addAction(self.dockAction)
         self.viewMenu.addSeparator()
         self.viewMenu.addAction(self.zoomAction)
+        self.viewMenu.addSeparator()
+        self.viewMenu.addAction(self.toggle3DAction)
+        self.viewMenu.addAction(self.fit3DAction)
+        self.viewMenu.addAction(self.reset3DCameraAction)
         self.viewMenu.aboutToShow.connect(self.updateViewMenu)
 
         # Window Menu
@@ -671,6 +763,7 @@ class MainWindow(QMainWindow):
             self.dockAction.setText('Hide &Dock')
         else:
             self.dockAction.setText('Show &Dock')
+        self._sync3DControls()
 
     def updateWindowMenu(self):
         self.colorDialogAction.setChecked(self.colorDialog.isActiveWindow())
@@ -710,6 +803,9 @@ class MainWindow(QMainWindow):
         openmc_args = {'threads': self.threads, 'model_path': self.model_path}
 
         if reload:
+            viewport3d = getattr(self, 'viewport3d', None)
+            if viewport3d is not None:
+                viewport3d.modelReloading()
             loader_thread = Thread(target=_openmcReload, kwargs=openmc_args)
             loader_thread.start()
             while loader_thread.is_alive():
@@ -717,6 +813,8 @@ class MainWindow(QMainWindow):
                 QApplication.processEvents()
 
             self.plotIm.model = self.model
+            if viewport3d is not None:
+                viewport3d.modelReloaded()
             self.applyChanges()
 
     def saveImage(self, filename=None):
@@ -726,11 +824,30 @@ class MainWindow(QMainWindow):
                                                         "untitled",
                                                         "Images (*.png)")
         if filename:
-            self.plotIm.saveImage(filename)
+            if self.in3D:
+                filename = str(filename)
+                if not Path(filename).suffix:
+                    filename += '.png'
+                # Wait for the full-resolution image
+                self.viewport3d.waitForRender(30000)
+                if not self.viewport3d.exportImage().save(filename):
+                    self.statusBar().showMessage(
+                        'Could not save the image to {}'.format(filename),
+                        5000)
+                    return
+            else:
+                self.plotIm.saveImage(filename)
             self.statusBar().showMessage('Plot Image Saved', 5000)
 
     def copyImageToClipboard(self):
-        if self.plotIm.copyImageToClipboard():
+        if self.in3D:
+            self.viewport3d.waitForRender(30000)
+            image = self.viewport3d.exportImage()
+            if not image.isNull():
+                QApplication.clipboard().setImage(image)
+                self.statusBar().showMessage('3D View Image Copied', 5000)
+                return True
+        elif self.plotIm.copyImageToClipboard():
             self.statusBar().showMessage('Plot Image Copied', 5000)
             return True
 
@@ -747,7 +864,9 @@ class MainWindow(QMainWindow):
                 filename += ".pltvw"
 
             saved = {'version': self.model.version,
-                     'current': self.model.currentView}
+                     'current': self.model.currentView,
+                     'view3d': self.model.view3d.to_dict(),
+                     'in3D': self.in3D}
             with open(filename, 'wb') as file:
                 pickle.dump(saved, file)
 
@@ -768,9 +887,19 @@ class MainWindow(QMainWindow):
                 self.model.activeView.outlinesCell = False
             if not hasattr(self.model.activeView, 'outlinesMat'):
                 self.model.activeView.outlinesMat = False
+            # View files written by older versions have no 3D settings
+            view3d = saved.get('view3d')
+            if isinstance(view3d, dict):
+                self.model.view3d = View3DState.from_dict(view3d)
+                self.view3DPanel.update()
+                self.particlePanel.updateOptions()
+                self.viewport3d.settingsChanged()
+                self.viewport3d.domainStylesChanged()
             self.geometryPanel.update()
             self.colorDialog.updateDialogValues()
             self.applyChanges()
+            if 'in3D' in saved and self.isVisible():
+                self.toggle3DView(bool(saved['in3D']))
             message = '{} loaded'.format(filename)
         else:
             message = 'Error loading plot settings. Incompatible model.'
@@ -852,7 +981,12 @@ class MainWindow(QMainWindow):
             self.closeStatePointAction = QAction("&Close statepoint", self)
             self.closeStatePointAction.setToolTip("Close current statepoint")
             self.closeStatePointAction.triggered.connect(self.closeStatePoint)
-            self.dataMenu.addAction(self.closeStatePointAction)
+            separator = getattr(self, "particleMenuSeparator", None)
+            if separator is not None:
+                self.dataMenu.insertAction(separator,
+                                           self.closeStatePointAction)
+            else:
+                self.dataMenu.addAction(self.closeStatePointAction)
         elif hasattr(self, "closeStatePointAction"):
             self.dataMenu.removeAction(self.closeStatePointAction)
 
@@ -864,6 +998,249 @@ class MainWindow(QMainWindow):
         self.sourceSitesDialog.show()
         self.sourceSitesDialog.raise_()
         self.sourceSitesDialog.activateWindow()
+
+    # Particle tracks
+
+    def _modelDirectory(self):
+        path = Path(self.model_path)
+        return path.parent if path.is_file() else path
+
+    def _announceLostParticles(self):
+        """Point out lost particle files written next to the model"""
+        try:
+            n = len(scan_directory(self._modelDirectory()))
+        except OSError:
+            return
+        if n:
+            self.statusBar().showMessage(
+                'Found {} lost particle file{} in the model directory. Use '
+                'Data > Open Lost Particle Folder... to show their '
+                'tracks.'.format(n, '' if n == 1 else 's'), 15000)
+
+    def openParticleFiles(self):
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, 'Open Particle Files', str(self._modelDirectory()),
+            'Particle files (*.h5);;All files (*)')
+        if paths:
+            self.addParticles(paths)
+
+    def openParticleFolder(self):
+        directory = QFileDialog.getExistingDirectory(
+            self, 'Open Lost Particle Folder', str(self._modelDirectory()))
+        if not directory:
+            return
+        try:
+            paths = scan_directory(directory)
+        except OSError:
+            paths = []
+        if not paths:
+            QMessageBox.information(
+                self, 'Open Lost Particle Folder',
+                'No lost particle files (particle_*.h5) were found in\n\n'
+                '{}'.format(directory))
+            return
+        self.addParticles(paths)
+
+    @staticmethod
+    def _particleKey(particle):
+        path = particle.path
+        if path:
+            try:
+                path = str(Path(path).resolve())
+            except OSError:
+                pass
+        return (path, particle.label)
+
+    def addParticles(self, paths):
+        """Load particle restart or track files and show their tracks
+
+        Parameters
+        ----------
+        paths : iterable of str or pathlib.Path
+            Particle restart files (``particle_*.h5``) or track files
+
+        Returns
+        -------
+        list of openmc_plotter.particles.ParticleTrackData
+            The particles that were added. Particles that are already loaded
+            are skipped.
+        """
+        existing = self.model.particleTracks
+        known = {self._particleKey(p) for p in existing}
+        new = []
+        errors = []
+        QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            for path in paths:
+                try:
+                    particles = load_particle_file(path)
+                except Exception as e:
+                    errors.append('{}: {}'.format(Path(path).name, e))
+                    continue
+                for particle in particles:
+                    key = self._particleKey(particle)
+                    if key not in known:
+                        known.add(key)
+                        new.append(particle)
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        if errors:
+            shown = errors[:20]
+            if len(errors) > len(shown):
+                shown.append('... and {} more'.format(
+                    len(errors) - len(shown)))
+            QMessageBox.warning(
+                self, 'Open Particle Files',
+                'Could not read {} file{}:\n\n{}'.format(
+                    len(errors), '' if len(errors) == 1 else 's',
+                    '\n'.join(shown)))
+
+        if new:
+            assign_colors(new, start=len(existing))
+            existing.extend(new)
+            self.particlesChanged()
+            self.dock.setVisible(True)
+            self.dock.showPanel(self.particlePanel)
+            if len(new) == 1:
+                self.particlePanel.selectParticle(new[0])
+            self.statusBar().showMessage('Loaded {} particle{}'.format(
+                len(new), '' if len(new) == 1 else 's'), 5000)
+        elif not errors:
+            self.statusBar().showMessage(
+                'The particles are already loaded', 5000)
+        return new
+
+    def clearParticleTracks(self):
+        self.particlePanel.cancelReplay()
+        self.model.particleTracks.clear()
+        self.particlesChanged()
+        self.statusBar().showMessage('Particle tracks cleared', 5000)
+
+    def particlesChanged(self, refresh_panel=True):
+        """Redraw the particle tracks after particles or options changed
+
+        Parameters
+        ----------
+        refresh_panel : bool
+            Whether to update the table and options of the particle panel
+        """
+        if self.in3D:
+            # The hidden 2D plot is redrawn when it is shown again
+            self._pixmapDirty = True
+        else:
+            self.plotIm.updatePixmap()
+        self.viewport3d.particlesChanged()
+        if refresh_panel:
+            self.particlePanel.update()
+        self.clearParticlesAction.setEnabled(bool(self.model.particleTracks))
+
+    def toggleParticleTracks2D(self, checked):
+        self.model.particleOptions['show2d'] = bool(checked)
+        self.particlesChanged()
+
+    def showParticleDetails(self, particle):
+        """Select a particle in the particle panel to show its details"""
+        self.dock.setVisible(True)
+        self.dock.showPanel(self.particlePanel)
+        self.particlePanel.selectParticle(particle)
+
+    def _referenceWidth(self, axes):
+        """Size in [cm] of the model along some axes"""
+        state = self.model.view3d
+        try:
+            extent = [float(state.scene_upper_right[i]) -
+                      float(state.scene_lower_left[i]) for i in axes]
+        except (TypeError, ValueError, IndexError):
+            extent = []
+        extent = [e for e in extent if math.isfinite(e) and e > 0.0]
+        if self.viewport3d.available and extent:
+            return max(extent)
+        dv = self.model.defaultView
+        return max(float(dv.width), float(dv.height))
+
+    @staticmethod
+    def _particlePosition(particle):
+        position = particle.key_position()
+        if position is None:
+            return None
+        position = np.asarray(position, dtype=float).reshape(-1)[:3]
+        if position.size < 3 or not np.all(np.isfinite(position)):
+            return None
+        return position
+
+    def showParticle(self, particle, in3d=None):
+        """Center the 2D or 3D view on where a particle was lost
+
+        Parameters
+        ----------
+        particle : openmc_plotter.particles.ParticleTrackData
+            Particle to show
+        in3d : bool, optional
+            Whether to show the particle in the 3D view. Defaults to the view
+            that is currently shown.
+        """
+        position = self._particlePosition(particle)
+        if position is None:
+            self.statusBar().showMessage(
+                '{} has no recorded position'.format(particle.summary()),
+                5000)
+            return
+        in3d = self.in3D if in3d is None else bool(in3d)
+        if in3d and not self.viewport3d.available:
+            self.statusBar().showMessage(
+                capability_message(self.viewport3d.capability), 10000)
+            return
+
+        particle.visible = True
+        if in3d:
+            self.model.view3d.show_tracks = True
+            self.toggle3DView(True)
+            self.particlesChanged()
+            self.particlePanel.selectParticle(particle)
+            axes = (0, 1, 2)
+            width = focus_width(particle, axes, self._referenceWidth(axes))
+            self.viewport3d.lookAt(position, width)
+            self.viewport3d.stateChanged.emit()
+        else:
+            self.model.particleOptions['show2d'] = True
+            self.particlesChanged()
+            self.particlePanel.selectParticle(particle)
+            axes = (self.xBasis, self.yBasis)
+            width = focus_width(particle, axes, self._referenceWidth(axes))
+            self.showPointIn2D(position, width)
+
+        self.statusBar().showMessage('Showing {} at ({})'.format(
+            particle.summary(),
+            ', '.join('{:.6g}'.format(x) for x in position)), 5000)
+
+    def cutThroughParticle(self, particle, axis=None):
+        """Cut the 3D view with a plane through where a particle was lost
+
+        Parameters
+        ----------
+        particle : openmc_plotter.particles.ParticleTrackData
+            Particle to show
+        axis : {'x', 'y', 'z'}, optional
+            Normal of the cut plane. Defaults to the axis closest to the
+            viewing direction.
+        """
+        position = self._particlePosition(particle)
+        if position is None:
+            self.statusBar().showMessage(
+                '{} has no recorded position'.format(particle.summary()),
+                5000)
+            return
+        if not self.toggle3DView(True):
+            return
+        particle.visible = True
+        self.model.view3d.show_tracks = True
+        self.particlesChanged()
+        self.particlePanel.selectParticle(particle)
+        self.viewport3d.lookAt(position)
+        self.viewport3d.cutThrough(position, axis)
+        self.statusBar().showMessage(
+            'Cut through {}'.format(particle.summary()), 5000)
 
     def applyChanges(self):
         if self.model.activeView != self.model.currentView:
@@ -1852,6 +2229,96 @@ class MainWindow(QMainWindow):
         self.resizePixmap()
         self.showMainWindow()
 
+    def toggle3DView(self, checked=None):
+        """Switch between the 2D slice plot and the ray-traced 3D view
+
+        Parameters
+        ----------
+        checked : bool, optional
+            Whether to show the 3D view. The view is toggled if not given.
+
+        Returns
+        -------
+        bool
+            Whether the 3D view is shown
+        """
+        show3d = (not self.in3D) if checked is None else bool(checked)
+        if show3d and not self.viewport3d.available:
+            self.statusBar().showMessage(
+                capability_message(self.viewport3d.capability), 10000)
+            show3d = False
+
+        if show3d != self.in3D:
+            # A QStackedWidget only resizes its current page, so the incoming
+            # page gets the current size before it is shown
+            rect = self.viewStack.contentsRect()
+            if show3d:
+                self.in3D = True
+                self.viewport3d.setGeometry(rect)
+                self.viewStack.setCurrentWidget(self.viewport3d)
+                self.viewport3d.activate()
+                self.viewport3d.setFocus()
+            else:
+                self.viewport3d.deactivate()
+                self.in3D = False
+                self.frame.setGeometry(rect)
+                self.viewStack.setCurrentWidget(self.frame)
+                if self._pixmapDirty:
+                    self._pixmapDirty = False
+                    self.plotIm.updatePixmap()
+                self.resizePixmap()
+                QtCore.QTimer.singleShot(0, self.resizePixmap)
+            self.geometryPanel.set3DMode(self.in3D)
+
+        self._sync3DControls()
+        return self.in3D
+
+    def _sync3DControls(self):
+        """Update the menu actions and dock panel of the 3D view"""
+        if not hasattr(self, 'toggle3DAction'):
+            return
+        available = self.viewport3d.available
+        self.toggle3DAction.setChecked(self.in3D)
+        self.toggle3DAction.setEnabled(available)
+        if not available:
+            message = capability_message(self.viewport3d.capability)
+            self.toggle3DAction.setToolTip(message)
+            self.toggle3DAction.setStatusTip(message)
+        self.fit3DAction.setEnabled(available)
+        self.reset3DCameraAction.setEnabled(available)
+        if hasattr(self, 'view3DPanel'):
+            self.view3DPanel.updateMode(self.in3D)
+
+    def _run3D(self, operation):
+        """Show the 3D view and apply an operation of the viewport"""
+        if self.toggle3DView(True):
+            operation()
+
+    def showPointIn2D(self, point, width=None):
+        """Center the 2D view on a point
+
+        Parameters
+        ----------
+        point : iterable of float
+            Point in [cm] that becomes the origin of the 2D view
+        width : float, optional
+            Size in [cm] of the shorter side of the view. The aspect ratio of
+            the view is kept. The zoom is unchanged if not given.
+        """
+        self.toggle3DView(False)
+        av = self.model.activeView
+        av.origin = [float(x) for x in np.reshape(point, -1)[:3]]
+        if width is not None and math.isfinite(width) and width > 0.0:
+            ratio = av.width / max(av.height, 1e-12)
+            if ratio >= 1.0:
+                av.height = float(width)
+                av.width = float(width) * ratio
+            else:
+                av.width = float(width)
+                av.height = float(width) / ratio
+        self._updateGeometryPanelFromActiveView()
+        self.applyChanges()
+
     def editZoomAct(self):
         percent, ok = QInputDialog.getInt(self, "Edit Zoom", "Zoom Percent:",
                                           self.geometryPanel.zoomBox.value(), 25, 2000)
@@ -2188,6 +2655,12 @@ class MainWindow(QMainWindow):
         self.updateScale()
         self.updateRelativeBases()
         self.plotIm.updatePixmap()
+        self._pixmapDirty = False
+
+        # Colors, opacities and visibility of the domains may have changed
+        if hasattr(self, 'viewport3d'):
+            self.viewport3d.domainStylesChanged()
+            self.view3DPanel.update()
 
         if self.model.previousViews:
             self.undoAction.setDisabled(False)
@@ -2263,7 +2736,15 @@ class MainWindow(QMainWindow):
         visible = int(self.colorDialog.isVisible())
         settings.setValue("colorDialog/Visible", visible)
 
-        openmc.lib.finalize()
+        # Stop the background threads that use openmc.lib before finalizing
+        if hasattr(self, 'particlePanel'):
+            self.particlePanel.shutdown()
+        if hasattr(self, 'viewport3d'):
+            self.viewport3d.shutdown()
+
+        with OPENMC_LIB_LOCK:
+            openmc.lib.finalize()
+            bump_lib_generation()
 
         self.saveSettings()
 
@@ -2326,7 +2807,9 @@ class MainWindow(QMainWindow):
             'currentView': self.model.currentView,
             'statepoint': self.model.statepoint,
             'mat_xml_hash': mat_xml_hash,
-            'geom_xml_hash': geom_xml_hash
+            'geom_xml_hash': geom_xml_hash,
+            'view3d': self.model.view3d.to_dict(),
+            'particles': dict(self.model.particleOptions)
         }
         if self.model_path.is_file():
             settings_pkl = self.model_path.with_name('plot_settings.pkl')

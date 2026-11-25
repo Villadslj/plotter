@@ -44,9 +44,26 @@ class ShortcutsOverlay(QWidget):
                             ("Reload Model", "Shift+" + c_key + "+R"),
                             ("Quit", c_key + "+Q"),
                             ("Display Shortcuts", "?")],
+                  "3D View": [("Toggle 3D View", c_key + "+3"),
+                              ("Orbit", "Left-drag, Arrows"),
+                              ("Pan", "Shift+Left-drag, Middle-drag"),
+                              ("Pan", "Shift+Arrows"),
+                              ("Zoom", "Scroll, " + c_key + "+Left-drag"),
+                              ("Zoom", "+/-"),
+                              ("Set Rotation Center", "Double-click"),
+                              ("Open Context Menu", "Right-click"),
+                              ("Fit to Model", "F"),
+                              ("Reset Camera", "R, Home"),
+                              ("View From +X/-X/+Y/-Y/+Z/-Z/Iso", "1-7"),
+                              ("Toggle Projection", "O"),
+                              ("Toggle Edges", "E"),
+                              ("Toggle Depth Shading", "D"),
+                              ("Toggle Particle Tracks", "T")],
                  "Input/Output" : [("Save View", c_key + "+S"),
                                    ("Open View", c_key + "+O"),
-                                   ("Save Plot Image", "Shift+" + c_key + "+S")]}
+                                   ("Save Plot Image", "Shift+" + c_key + "+S"),
+                                   ("Open Particle Files",
+                                    "Shift+" + c_key + "+L")]}
 
     # colors
     header_color = QtGui.QColor(150, 150, 150, 255)

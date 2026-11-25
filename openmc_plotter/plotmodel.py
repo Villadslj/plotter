@@ -7,9 +7,11 @@ from dataclasses import dataclass
 import hashlib
 import itertools
 import pickle
+import threading
 from typing import Literal, Tuple, Optional, Dict
 
-from PySide6.QtWidgets import QItemDelegate, QColorDialog, QLineEdit, QMessageBox
+from PySide6.QtWidgets import (QItemDelegate, QColorDialog, QLineEdit,
+                               QMessageBox, QDoubleSpinBox)
 from PySide6.QtCore import (QAbstractTableModel, QModelIndex, Qt, QSize, QEvent,
                             QObject, Signal, Slot, QThread, QEventLoop, QTimer)
 from PySide6.QtGui import QColor
@@ -20,12 +22,35 @@ import numpy as np
 from . import __version__
 from .statepointmodel import StatePointModel
 from .plot_colors import random_rgb
+from .render3d import View3DState
+from .particles import particle_option_defaults
 
-ID, NAME, COLOR, COLORLABEL, MASK, HIGHLIGHT = range(6)
+ID, NAME, COLOR, COLORLABEL, MASK, HIGHLIGHT, OPACITY = range(7)
 
 _VOID_REGION = -1
 _NOT_FOUND = -2
 _OVERLAP = -3
+
+# Serializes calls into openmc.lib made by the 2D plot worker, the 3D render
+# thread and model reloads
+OPENMC_LIB_LOCK = threading.RLock()
+_lib_generation = 0
+
+
+def lib_generation():
+    """Number of times openmc.lib has been re-initialized by the plotter"""
+    return _lib_generation
+
+
+def bump_lib_generation():
+    """Record that openmc.lib has been re-initialized
+
+    Objects created through openmc.lib, e.g. ray-traced plots, are invalid
+    after a re-initialization and are re-created when the generation changes.
+    """
+    global _lib_generation
+    _lib_generation += 1
+    return _lib_generation
 
 _MODEL_PROPERTIES = ('temperature', 'density')
 _PROPERTY_INDICES = {'temperature': 0, 'density': 1}
@@ -146,8 +171,9 @@ class PlotWorker(QObject):
             view_param.basis = params["basis"]
             view_param.level = params["level"]
             view_param.color_overlaps = params["color_overlaps"]
-            ids_map = openmc.lib.id_map(view_param)
-            properties = openmc.lib.property_map(view_param)
+            with OPENMC_LIB_LOCK:
+                ids_map = openmc.lib.id_map(view_param)
+                properties = openmc.lib.property_map(view_param)
             self.finished.emit(work_item.view_params, ids_map, properties)
         except Exception as exc:
             self.error.emit(str(exc))
@@ -353,6 +379,8 @@ class PlotModel:
         self.sourceSitesVisible = True
         self.sourceSites = None
 
+        data = None
+        restore_domains = False
         if model_path.is_file():
             settings_pkl = model_path.with_name('plot_settings.pkl')
         else:
@@ -412,6 +440,29 @@ class PlotModel:
             self.currentView = copy.deepcopy(self.defaultView)
 
         self.activeView = copy.deepcopy(self.currentView)
+
+        # 3D view settings and particle tracks. Hidden, ghosted and isolated
+        # domains refer to IDs, so they are only restored for the same model.
+        self.view3d = View3DState()
+        self.particleTracks = []
+        self.particleOptions = particle_option_defaults()
+        if data is not None and data.get('version') == self.version:
+            view3d = data.get('view3d')
+            try:
+                if isinstance(view3d, dict):
+                    self.view3d = View3DState.from_dict(view3d)
+                elif isinstance(view3d, View3DState):
+                    self.view3d = view3d
+            except Exception:
+                self.view3d = View3DState()
+            if not restore_domains:
+                self.view3d.show_all()
+            options = data.get('particles')
+            if isinstance(options, dict):
+                self.particleOptions.update(
+                    {k: v for k, v in options.items()
+                     if k in self.particleOptions})
+
         self.plot_manager = PlotManager()
 
     def openStatePoint(self, filename):
@@ -512,8 +563,9 @@ class PlotModel:
         if ids_map is None or properties is None:
             if (self.currentView.view_params != view.view_params) or \
                 (self.ids_map is None) or (self.properties is None):
-                self.ids_map = openmc.lib.id_map(view.view_params)
-                self.properties = openmc.lib.property_map(view.view_params)
+                with OPENMC_LIB_LOCK:
+                    self.ids_map = openmc.lib.id_map(view.view_params)
+                    self.properties = openmc.lib.property_map(view.view_params)
             self.map_view_params = self.view_params_payload(view)
         else:
             self.ids_map = ids_map
@@ -601,7 +653,8 @@ class PlotModel:
         if n == 0:
             self.source_sites = None
             return
-        sites = openmc.lib.sample_external_source(n)
+        with OPENMC_LIB_LOCK:
+            sites = openmc.lib.sample_external_source(n)
         self.sourceSites = np.array([s.r for s in sites[:n]], dtype=float)
 
     def storeCurrent(self):
@@ -1405,19 +1458,29 @@ class DomainViewDict(dict):
 
     def set_name(self, key: int, name: Optional[str]):
         domain = self[key]
-        self[key] = DomainView(domain.id, name, domain.color, domain.masked, domain.highlight)
+        self[key] = DomainView(domain.id, name, domain.color, domain.masked,
+                               domain.highlight, domain.opacity)
 
     def set_color(self, key: int, color):
         domain = self[key]
-        self[key] = DomainView(domain.id, domain.name, color, domain.masked, domain.highlight)
+        self[key] = DomainView(domain.id, domain.name, color, domain.masked,
+                               domain.highlight, domain.opacity)
 
     def set_masked(self, key: int, masked: bool):
         domain = self[key]
-        self[key] = DomainView(domain.id, domain.name, domain.color, masked, domain.highlight)
+        self[key] = DomainView(domain.id, domain.name, domain.color, masked,
+                               domain.highlight, domain.opacity)
 
     def set_highlight(self, key: int, highlight: bool):
         domain = self[key]
-        self[key] = DomainView(domain.id, domain.name, domain.color, domain.masked, highlight)
+        self[key] = DomainView(domain.id, domain.name, domain.color,
+                               domain.masked, highlight, domain.opacity)
+
+    def set_opacity(self, key: int, opacity: float):
+        domain = self[key]
+        opacity = min(1.0, max(0.0, float(opacity)))
+        self[key] = DomainView(domain.id, domain.name, domain.color,
+                               domain.masked, domain.highlight, opacity)
 
 
 class DomainView:
@@ -1437,9 +1500,13 @@ class DomainView:
     highlight : bool
         Indication of whether cell/material should be highlighted
         (defaults to False)
+    opacity : float
+        Opacity of the cell/material in the 3D view between 0 (invisible)
+        and 1 (opaque) (defaults to 1)
     """
 
-    def __init__(self, id, name, color=None, masked=False, highlight=False):
+    def __init__(self, id, name, color=None, masked=False, highlight=False,
+                 opacity=1.0):
         """ Initialize DomainView instance """
 
         self.id = id
@@ -1447,14 +1514,18 @@ class DomainView:
         self.color = color
         self.masked = masked
         self.highlight = highlight
+        self.opacity = opacity
+
+    def __setstate__(self, state):
+        # Settings saved by older versions have no opacity
+        self.__dict__.update(state)
+        self.__dict__.setdefault('opacity', 1.0)
 
     def __repr__(self):
         return ("id: {} \nname: {} \ncolor: {} \
-                \nmask: {} \nhighlight: {}\n\n".format(self.id,
-                                                         self.name,
-                                                         self.color,
-                                                         self.masked,
-                                                         self.highlight))
+                \nmask: {} \nhighlight: {} \nopacity: {}\n\n".format(
+                    self.id, self.name, self.color, self.masked,
+                    self.highlight, self.opacity))
 
     def __eq__(self, other):
         if isinstance(other, DomainView):
@@ -1473,7 +1544,7 @@ class DomainTableModel(QAbstractTableModel):
         return len(self.keys)
 
     def columnCount(self, index=QModelIndex()):
-        return 6
+        return 7
 
     def data(self, index, role=Qt.DisplayRole):
 
@@ -1498,6 +1569,12 @@ class DomainTableModel(QAbstractTableModel):
                 return None
             elif column == HIGHLIGHT:
                 return None
+            elif column == OPACITY:
+                return '{:.2f}'.format(domain.opacity)
+
+        elif role == Qt.EditRole:
+            if column == OPACITY:
+                return float(domain.opacity)
 
         elif role == Qt.ToolTipRole:
             if column == NAME:
@@ -1506,10 +1583,15 @@ class DomainTableModel(QAbstractTableModel):
                 return 'Double-click to edit \nRight-click to clear'
             elif column in (MASK, HIGHLIGHT):
                 return 'Click to toggle'
+            elif column == OPACITY:
+                return ('Opacity in the 3D view (0 = invisible, 1 = opaque)'
+                        '\nDouble-click to edit')
 
         elif role == Qt.TextAlignmentRole:
             if column in (MASK, HIGHLIGHT, COLOR):
                 return int(Qt.AlignCenter | Qt.AlignVCenter)
+            elif column == OPACITY:
+                return int(Qt.AlignRight | Qt.AlignVCenter)
             else:
                 return int(Qt.AlignLeft | Qt.AlignVCenter)
 
@@ -1539,7 +1621,7 @@ class DomainTableModel(QAbstractTableModel):
         elif role == Qt.DisplayRole:
             if orientation == Qt.Horizontal:
                 headers = ['ID', 'Name', 'Color',
-                           'SVG/RGB', 'Mask', 'Highlight']
+                           'SVG/RGB', 'Mask', 'Highlight', '3D Opacity']
                 return headers[section]
             return int(section + 1)
 
@@ -1553,7 +1635,7 @@ class DomainTableModel(QAbstractTableModel):
         elif index.column() in (MASK, HIGHLIGHT):
             return Qt.ItemFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable |
                                 Qt.ItemIsSelectable)
-        elif index.column() in (NAME, COLORLABEL):
+        elif index.column() in (NAME, COLORLABEL, OPACITY):
             return Qt.ItemFlags(Qt.ItemIsEnabled | Qt.ItemIsEditable |
                                 Qt.ItemIsSelectable)
         elif index.column() == COLOR:
@@ -1582,6 +1664,14 @@ class DomainTableModel(QAbstractTableModel):
         elif column == HIGHLIGHT:
             if role == Qt.CheckStateRole:
                 self.domains.set_highlight(key, Qt.CheckState(value) == Qt.Checked)
+        elif column == OPACITY:
+            try:
+                opacity = float(value)
+            except (TypeError, ValueError):
+                return False
+            if not np.isfinite(opacity):
+                return False
+            self.domains.set_opacity(key, opacity)
 
         self.dataChanged.emit(index, index)
         return True
@@ -1604,6 +1694,8 @@ class DomainDelegate(QItemDelegate):
             return QSize(fm.boundingRect("X(XXX, XXX, XXX)X").width(), fm.height())
         elif column == MASK:
             return QSize(fm.boundingRect("XXXX").width(), fm.height())
+        elif column == OPACITY:
+            return QSize(fm.boundingRect("X3D OpacityX").width(), fm.height())
         else:
             return QItemDelegate.sizeHint(self, option, index)
 
@@ -1614,6 +1706,12 @@ class DomainDelegate(QItemDelegate):
             return dialog
         elif index.column() == COLORLABEL:
             return QLineEdit(parent)
+        elif index.column() == OPACITY:
+            editor = QDoubleSpinBox(parent)
+            editor.setRange(0.0, 1.0)
+            editor.setSingleStep(0.05)
+            editor.setDecimals(2)
+            return editor
         else:
             return QItemDelegate.createEditor(self, parent, option, index)
 
@@ -1623,6 +1721,9 @@ class DomainDelegate(QItemDelegate):
             color = index.data(Qt.BackgroundRole)
             color = 'white' if color is None else color
             editor.setCurrentColor(color)
+        elif index.column() == OPACITY:
+            value = index.data(Qt.EditRole)
+            editor.setValue(1.0 if value is None else float(value))
         elif index.column() in (NAME, COLORLABEL):
             text = index.data(Qt.DisplayRole)
             if text != '--':
@@ -1684,5 +1785,8 @@ class DomainDelegate(QItemDelegate):
                               input,
                               Qt.BackgroundRole)
                 model.setData(index, input, Qt.DisplayRole)
+        elif column == OPACITY:
+            editor.interpretText()
+            model.setData(index, editor.value(), Qt.EditRole)
         else:
             QItemDelegate.setModelData(self, editor, model, index)
