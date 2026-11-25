@@ -128,6 +128,14 @@ def _normalize(v):
     return v / norm
 
 
+def _elevation(forward):
+    """Angle in radians between a direction and the xy-plane
+
+    Unlike asin(forward[2]), this stays accurate near the poles.
+    """
+    return math.atan2(forward[2], math.hypot(forward[0], forward[1]))
+
+
 def _rotate(v, axis, angle):
     """Rotate a vector about an axis by an angle in radians (Rodrigues)"""
     k = _normalize(axis)
@@ -294,7 +302,7 @@ class Camera3D:
     @property
     def elevation(self):
         """Angle between the viewing direction and the xy-plane in degrees"""
-        return math.degrees(math.asin(max(-1.0, min(1.0, self.forward[2]))))
+        return math.degrees(_elevation(self.forward))
 
     # Position
 
@@ -369,7 +377,7 @@ class Camera3D:
             # Cameras that are upside down tilt freely. The tolerance keeps
             # rounding errors at the poles from disabling the limit.
             if u[2] >= -1e-9:
-                elevation = math.asin(max(-1.0, min(1.0, f[2])))
+                elevation = _elevation(f)
                 new_elevation = max(-math.pi / 2,
                                     min(math.pi / 2, elevation + pitch))
                 pitch = new_elevation - elevation
